@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lca-stack"
+version = "0.1.0"
+description = "Lightweight messaging bridge + MCAP logger for autonomy experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+  "mcap>=1.3.0",
+]
+
+authors = [
+  # { name = "Cristian Nino", email = "nino.cristian@icloud.com" }
+]
+keywords = ["robotics", "autonomy", "logging", "mcap", "dds", "ipc"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Typing :: Typed",
+  "License :: GNU Affero General Public License v3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.8",
+]
+
+[project.urls]
+Repository = "https://github.com/<org-or-user>/lca-stack"
+
+[project.scripts]
+lca-daemon = "lca_stack.daemon.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lca_stack = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_configs = true
+mypy_path = "src"
+files = ["src"]
+exclude = "(?x)(^examples/|^runs/|^venv/|^\.venv/)"
+show_error_codes = true

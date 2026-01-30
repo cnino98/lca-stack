@@ -1,0 +1,35 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/boston_dynamics/spot/protos/Spot.proto"
+
+WorldInfo {
+  info [
+    "Boston Dynamics' Spot quadruped."
+  ]
+  title "Spot"
+}
+Viewpoint {
+  orientation -0.10311089632172071 0.6417405197132678 0.7599587149430396 0.6949228976889259
+  position -8.023102348069827 -4.9448354731068065 4.461593039194462
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+Floor {
+  size 100 100
+}
+Spot {
+  controller "adapter_webots_spot"
+  controllerArgs [
+    "--agent-id"
+    "cf1"
+    "--daemon-host"
+    "127.0.0.1"
+    "--daemon-port"
+    "5001"
+  ]
+}
