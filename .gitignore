@@ -35,11 +35,11 @@ runs/
 # --- Logs ---
 *.log
 
-# --- Webots extras (safe defaults) ---
+# --- Webots extras ---
 *.wbk
 *.wbo
 *.wbt~
 *.png~
-*.jpg~
+*.jpg
 *.jpeg~
 *.webp~

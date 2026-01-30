@@ -10,7 +10,16 @@ LCA Stack standardizes how agents communicate and how experiments are recorded. 
 - [LCA Stack](#lca-stack)
   - [Table of contents](#table-of-contents)
   - [Overview](#overview)
-  - [Key concepts](#key-concepts)
+  - [Quickstart](#quickstart)
+    - [Requirements](#requirements)
+    - [Install](#install)
+    - [Run the Agent Daemon](#run-the-agent-daemon)
+    - [Connect an Adapter and Autonomy](#connect-an-adapter-and-autonomy)
+    - [Run artifacts](#run-artifacts)
+    - [Example adapters and autonomy](#example-adapters-and-autonomy)
+  - [Key concepts, terminology, and acronyms](#key-concepts-terminology-and-acronyms)
+    - [Core terms](#core-terms)
+    - [Acronyms](#acronyms)
   - [Messaging model](#messaging-model)
     - [Topics](#topics)
     - [Message types](#message-types)
@@ -21,9 +30,6 @@ LCA Stack standardizes how agents communicate and how experiments are recorded. 
     - [Run manifest](#run-manifest)
     - [Typical directory layout](#typical-directory-layout)
   - [Architecture](#architecture)
-    - [Terminology and acronyms](#terminology-and-acronyms)
-      - [Core terms](#core-terms)
-      - [Acronyms](#acronyms)
     - [System layout](#system-layout)
     - [Responsibilities](#responsibilities)
       - [Platform Adapter](#platform-adapter)
@@ -90,7 +96,7 @@ lca-daemon --agent-id cf1 --adapter-port 5001 --autonomy-port 5002
 - **Adapter** connects to the daemon’s **adapter port** (example: `5001`) and publishes platform observations as JSONL.
 - **Autonomy** connects to the daemon’s **autonomy port** (example: `5002`) and publishes actuation requests as JSONL.
 
-Each message should be a single JSON object per line and include the common `header` fields described above. In Python you can use `lca_stack.ipc.make_header(...)`.
+Each message should be a single JSON object per line and include the common `header` fields described below. In Python you can use `lca_stack.ipc.make_header(...)`.
 
 ### Run artifacts
 
@@ -112,17 +118,30 @@ python3 examples/autonomy/spot_keyboard.py --host 127.0.0.1 --port 5002 --agent-
 
 For simulator-specific wiring (for example Webots `controllerArgs`), see the example adapter directory under `examples/`.
 
+---
 
-## Key concepts
+## Key concepts, terminology, and acronyms
 
+### Core terms
 - **Agent**: A participant in the experiment (robot, simulated actor, or human interface).
-- **Platform Adapter**: A platform-facing process that talks to a simulator or hardware API and applies actuation.
+- **Process**: A running program on an agent (often called a “node” in robotics).
+- **Platform Adapter (Adapter)**: A platform-facing process that talks to a simulator or hardware API and applies actuation.
 - **Autonomy Process**: Decision-making code (planning, control, coordination). Any language/framework.
 - **Agent Daemon**: Standard infrastructure process that provides:
   - DDS messaging (publish/subscribe)
   - MCAP recording (flight recorder)
   - Safety Guard (local command checks)
   - Run lifecycle events and run manifest
+
+### Acronyms
+- **API** (Application Programming Interface): A defined way for software components to communicate.
+- **DDS** (Data Distribution Service): An industry-standard publish/subscribe messaging system for distributed real-time systems.
+- **QoS** (Quality of Service): Delivery settings for messages (for example: reliable vs best-effort).
+- **MCAP** (Message Capture): A file format for recording time-stamped message streams.
+- **IPC** (Inter-Process Communication): Communication between processes on the same machine.
+- **TCP** (Transmission Control Protocol): A reliable network protocol commonly used for local sockets.
+- **UDP** (User Datagram Protocol): A lightweight network protocol commonly used for low-latency messaging.
+- **UUID** (Universally Unique Identifier): A unique ID used to label a run (`run_id`) or other artifacts.
 
 ---
 
@@ -225,25 +244,6 @@ runs/<run_id>/
 ## Architecture
 
 This project provides a **distributed messaging and logging backbone** for multi-agent experiments. Each agent runs a small, standard **Agent Daemon** responsible for networking and recording. Autonomy code (the “brains”) can be written in any language and connects locally to the daemon. Platform-specific control (simulator or hardware) is isolated behind an **Adapter**.
-
-### Terminology and acronyms
-
-#### Core terms
-- **Agent**: A participant in the experiment (robot, simulated actor, or human interface).
-- **Process**: A running program on an agent (often called a “node” in robotics).
-- **Adapter**: A platform-facing process that talks to the simulator or hardware API and applies actuation.
-- **Autonomy Process**: The agent’s decision-making code (planning, control, coordination). Language and framework are up to the team.
-- **Agent Daemon**: The standard infrastructure process that provides messaging, recording, safety gating, and run lifecycle.
-
-#### Acronyms
-- **API** (Application Programming Interface): A defined way for software components to communicate.
-- **DDS** (Data Distribution Service): An industry-standard publish/subscribe messaging system for distributed real-time systems.
-- **QoS** (Quality of Service): Delivery settings for messages (for example: reliable vs best-effort).
-- **MCAP** (Message Capture): A file format for recording time-stamped message streams.
-- **IPC** (Inter-Process Communication): Communication between processes on the same machine.
-- **TCP** (Transmission Control Protocol): A reliable network protocol commonly used for local sockets.
-- **UDP** (User Datagram Protocol): A lightweight network protocol commonly used for low-latency messaging.
-- **UUID** (Universally Unique Identifier): A unique ID used to label a run (`run_id`) or other artifacts.
 
 ### System layout
 

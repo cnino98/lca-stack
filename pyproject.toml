@@ -51,5 +51,5 @@ strict = true
 warn_unused_configs = true
 mypy_path = "src"
 files = ["src"]
-exclude = "(?x)(^examples/|^runs/|^venv/|^\.venv/)"
+exclude = '(?x)(^examples/|^runs/|^venv/|^\.venv/)'
 show_error_codes = true

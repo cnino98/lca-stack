@@ -2,8 +2,8 @@
 
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/boston_dynamics/spot/protos/Spot.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/UnevenTerrain.proto"
 
 WorldInfo {
   info [
@@ -12,15 +12,14 @@ WorldInfo {
   title "Spot"
 }
 Viewpoint {
-  orientation -0.10311089632172071 0.6417405197132678 0.7599587149430396 0.6949228976889259
-  position -8.023102348069827 -4.9448354731068065 4.461593039194462
+  orientation -0.11220373124869092 0.6285071762660226 0.769668144121856 0.724220530591491
+  position -3.7678417059029528 -2.41143294910151 2.701952551202158
+  follow "Spot"
+  followType "Mounted Shot"
 }
 TexturedBackground {
 }
 TexturedBackgroundLight {
-}
-Floor {
-  size 100 100
 }
 Spot {
   controller "adapter_webots_spot"
@@ -32,4 +31,9 @@ Spot {
     "--daemon-port"
     "5001"
   ]
+}
+UnevenTerrain {
+  translation 0 0 -6.25
+  size 100 100 10
+  perlinNOctaves 10
 }
