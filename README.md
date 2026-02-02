@@ -96,15 +96,28 @@ lca-daemon --agent-id cf1 --adapter-port 5001 --autonomy-port 5002
 - **Adapter** connects to the daemon’s **adapter port** (example: `5001`) and publishes platform observations as JSONL.
 - **Autonomy** connects to the daemon’s **autonomy port** (example: `5002`) and publishes actuation requests as JSONL.
 
-Each message should be a single JSON object per line and include the common `header` fields described below. In Python you can use `lca_stack.ipc.make_header(...)`.
+On connect, the daemon immediately sends a one-line **handshake** (`kind: lca_handshake_v1`) so both sides learn:
+- `run_id` (daemon-generated; source of truth for artifacts)
+- `agent_id` (daemon config)
+- `protocol_version`
+- ports + scenario/seed (if provided on the daemon CLI)
+
+After the handshake, processes exchange newline-delimited JSON objects. Each message should include the common `header` fields described below. In Python you can use `lca_stack.ipc.make_header(...)`.
+
+If a message arrives without a valid header, the daemon will **inject** one using daemon time, mark the payload with `lca_meta.header_injected: true`, and emit a `run/event` warning.
 
 ### Run artifacts
 
-When the first valid header is observed, the daemon creates an MCAP log at:
+Each daemon invocation corresponds to a single run. The daemon generates a fresh `run_id` at startup and creates a run directory immediately:
 
 ```
-runs/<run_id>/logs/<agent_id>.mcap
+runs/<run_id>/
+  manifest.yaml
+  logs/
+    <agent_id>.mcap
 ```
+
+The daemon writes `manifest.yaml` at run start and finalizes it at run stop. Run lifecycle and diagnostic messages are published on the `run/event` topic (including `run_start`, `run_stop`, disconnects, and warnings).
 
 ### Example adapters and autonomy
 
@@ -176,8 +189,20 @@ Every message recorded or transmitted should include a common header to support 
 
 Why these fields exist:
 - `seq` detects drops/reordering per sender.
-- `t_mono_ns` provides strict ordering within one agent.
-- `t_wall_ns` supports cross-agent alignment during analysis.
+- `t_mono_ns` provides strict ordering within one process / machine.
+- `t_wall_ns` enables cross-agent alignment **only** when you have a clock sync / offset model.
+
+Time model:
+- `t_mono_ns`: **originating process monotonic time**. Use this for ordering on that machine. It should be non-decreasing per `(origin_agent_id, origin_topic)`.
+- `t_wall_ns`: **originating process wall time**. Cross-agent comparisons require time synchronization (e.g., **PTP** via linuxptp, or NTP as a looser alternative) or an explicit offset model.
+- MCAP `log_time`: **daemon receive time** (wall-like time computed from a monotonic anchor so it won’t go backward). This is reliable for local ordering inside one daemon even if the system wall clock jumps.
+
+Message identity / alignment:
+- Every payload should include a `topic` string (do not rely only on the MCAP channel name).
+- Every payload should include an origin key so the “same message” is matchable across agents/logs:
+  - `origin_agent_id`, `origin_seq`, `origin_topic`
+
+The daemon will inject/normalize `topic` and origin fields if they are missing.
 
 ### Delivery settings (QoS)
 
@@ -209,24 +234,25 @@ Each run produces:
 ### MCAP logs (per agent)
 
 Each agent writes an MCAP file containing time-stamped streams for:
-- Incoming DDS messages (what the agent received)
-- Outgoing DDS messages (what the agent published)
-- Adapter observations and actuation
-- Autonomy-to-daemon requests (optional, recommended for debugging)
-- Run events and safety events
+- `local/adapter/observation` — observations sent from Adapter → Daemon (and forwarded to Autonomy)
+- `local/autonomy/actuation_request` — requests sent from Autonomy → Daemon
+- `local/adapter/actuation` — the final actuation the Adapter receives (post-safety; currently pass-through)
+- `run/event` — lifecycle + diagnostics (handshake, `run_start`, `run_stop`, disconnects, warnings)
+
+MCAP timestamps:
+- `publish_time` is taken from the message header (`t_wall_ns`, i.e., the originating process wall time).
+- `log_time` is the daemon receive time (computed from a monotonic anchor).
 
 Recording both **sent** and **received** DDS messages matters: it preserves what each agent actually observed on the network.
 
 ### Run manifest
 
 Each run produces a small manifest file that describes:
-- `run_id` (UUID)
-- participating agent IDs
-- scenario name/version
-- software version identifiers (commit hashes or version strings)
-- configuration parameters and random seed
-- start and end time
-- outcomes/notes (optional)
+- `run_id` + `agent_id`
+- `host` + ports (`adapter`, `autonomy`)
+- `start_wall` / `end_wall`
+- scenario + seed (if provided)
+- clock anchors + a lightweight clock health snapshot (offset/spread diagnostics)
 
 ### Typical directory layout
 

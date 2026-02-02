@@ -43,6 +43,10 @@ def make_header(run_id: str, agent_id: str, seq: int) -> HeaderDict:
 
 def extract_header(json_line: str) -> Header:
     message = _load_json_object(json_line, context="message")
+    return extract_header_from_obj(message)
+
+
+def extract_header_from_obj(message: Mapping[str, object]) -> Header:
     header_obj_raw = message.get("header")
     if not isinstance(header_obj_raw, dict):
         raise ValueError("missing header object")
@@ -56,6 +60,13 @@ def extract_header(json_line: str) -> Header:
     t_wall_ns = _as_int(header_obj.get("t_wall_ns"), field="header.t_wall_ns")
 
     return Header(run_id=run_id, agent_id=agent_id, seq=seq, t_mono_ns=t_mono_ns, t_wall_ns=t_wall_ns)
+
+
+def try_extract_header_from_obj(message: Mapping[str, object]) -> Header | None:
+    try:
+        return extract_header_from_obj(message)
+    except Exception:
+        return None
 
 
 def extract_header_lite(json_line: str) -> HeaderLite:

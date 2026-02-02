@@ -20,6 +20,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--adapter-port", type=int, required=True)
     parser.add_argument("--autonomy-port", type=int, required=True)
+    parser.add_argument("--scenario", default=None, help="Scenario name/version (recorded in manifest)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (recorded in manifest)")
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--log-level", default="INFO", choices=sorted(_LOG_LEVELS.keys()))
     args = parser.parse_args(argv)
@@ -28,6 +30,8 @@ def main(argv: list[str] | None = None) -> None:
     host: str = str(args.host)
     adapter_port: int = int(args.adapter_port)
     autonomy_port: int = int(args.autonomy_port)
+    scenario: str | None = str(args.scenario) if args.scenario not in (None, "") else None
+    seed: int | None = int(args.seed) if args.seed is not None else None
     runs_dir: Path = Path(str(args.runs_dir))
     log_level_name: str = str(args.log_level)
 
@@ -42,6 +46,8 @@ def main(argv: list[str] | None = None) -> None:
         adapter_port=adapter_port,
         autonomy_port=autonomy_port,
         runs_dir=runs_dir,
+        scenario=scenario,
+        seed=seed,
     )
 
 

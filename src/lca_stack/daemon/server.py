@@ -15,6 +15,12 @@ class Connections:
     autonomy_addr: SocketAddress
 
 
+@dataclass(frozen=True, slots=True)
+class Listeners:
+    adapter_listener: socket.socket
+    autonomy_listener: socket.socket
+
+
 def _listen(host: str, port: int) -> socket.socket:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -23,9 +29,27 @@ def _listen(host: str, port: int) -> socket.socket:
     return listener
 
 
+def listen_pair(host: str, adapter_port: int, autonomy_port: int) -> Listeners:
+    """Create two TCP listeners.
+
+    The daemon uses separate ports for Adapter and Autonomy local links.
+    """
+    return Listeners(
+        adapter_listener=_listen(host, adapter_port),
+        autonomy_listener=_listen(host, autonomy_port),
+    )
+
+
+def accept_one(listener: socket.socket) -> tuple[socket.socket, SocketAddress]:
+    conn, addr = listener.accept()
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return conn, addr
+
+
 def accept_two(host: str, adapter_port: int, autonomy_port: int) -> Connections:
-    adapter_listener = _listen(host, adapter_port)
-    autonomy_listener = _listen(host, autonomy_port)
+    listeners = listen_pair(host, adapter_port, autonomy_port)
+    adapter_listener = listeners.adapter_listener
+    autonomy_listener = listeners.autonomy_listener
 
     try:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="accept") as pool:

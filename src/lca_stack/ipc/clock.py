@@ -23,5 +23,13 @@ class MonotonicWallClock:
         self._wall0 = time.time_ns()
         self._mono0 = time.monotonic_ns()
 
+    @property
+    def wall0_ns(self) -> int:
+        return int(self._wall0)
+
+    @property
+    def mono0_ns(self) -> int:
+        return int(self._mono0)
+
     def now_wall_ns(self) -> int:
         return int(self._wall0 + (time.monotonic_ns() - self._mono0))

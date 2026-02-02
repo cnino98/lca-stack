@@ -6,6 +6,8 @@ from typing import BinaryIO, Protocol, Self, cast
 
 TOPIC_OBSERVATION = "local/adapter/observation"
 TOPIC_ACTUATION_REQUEST = "local/autonomy/actuation_request"
+TOPIC_ACTUATION = "local/adapter/actuation"
+TOPIC_RUN_EVENT = "run/event"
 
 _SCHEMA_NAME = "lca/json_object"
 _SCHEMA_JSON = b'{"type":"object"}'
@@ -40,6 +42,8 @@ class _McapWriter(Protocol):
 class _ChannelIds:
     observation: int
     actuation_request: int
+    actuation: int
+    run_event: int
 
 
 class McapLogger:
@@ -49,6 +53,8 @@ class McapLogger:
     _channels: _ChannelIds
     _observation_sequence: int
     _actuation_sequence: int
+    _actuation_final_sequence: int
+    _event_sequence: int
     _closed: bool
 
     def __init__(self, *, path: Path, writer: _McapWriter, file: BinaryIO, channels: _ChannelIds) -> None:
@@ -58,6 +64,8 @@ class McapLogger:
         self._channels = channels
         self._observation_sequence = 0
         self._actuation_sequence = 0
+        self._actuation_final_sequence = 0
+        self._event_sequence = 0
         self._closed = False
 
     @property
@@ -101,7 +109,26 @@ class McapLogger:
             metadata={},
         )
 
-        channels = _ChannelIds(observation=observation_channel_id, actuation_request=actuation_channel_id)
+        actuation_final_channel_id = writer.register_channel(
+            topic=TOPIC_ACTUATION,
+            message_encoding=MessageEncoding.JSON,
+            schema_id=schema_id,
+            metadata={},
+        )
+
+        run_event_channel_id = writer.register_channel(
+            topic=TOPIC_RUN_EVENT,
+            message_encoding=MessageEncoding.JSON,
+            schema_id=schema_id,
+            metadata={},
+        )
+
+        channels = _ChannelIds(
+            observation=observation_channel_id,
+            actuation_request=actuation_channel_id,
+            actuation=actuation_final_channel_id,
+            run_event=run_event_channel_id,
+        )
         return cls(path=path, writer=writer, file=file, channels=channels)
 
     def log_observation(self, log_time_ns: int, publish_time_ns: int, payload: bytes) -> None:
@@ -122,6 +149,26 @@ class McapLogger:
             publish_time=int(publish_time_ns),
             data=payload,
             sequence=int(self._actuation_sequence),
+        )
+
+    def log_actuation(self, log_time_ns: int, publish_time_ns: int, payload: bytes) -> None:
+        self._actuation_final_sequence = (self._actuation_final_sequence + 1) & 0xFFFFFFFF
+        self._writer.add_message(
+            self._channels.actuation,
+            log_time=int(log_time_ns),
+            publish_time=int(publish_time_ns),
+            data=payload,
+            sequence=int(self._actuation_final_sequence),
+        )
+
+    def log_run_event(self, log_time_ns: int, publish_time_ns: int, payload: bytes) -> None:
+        self._event_sequence = (self._event_sequence + 1) & 0xFFFFFFFF
+        self._writer.add_message(
+            self._channels.run_event,
+            log_time=int(log_time_ns),
+            publish_time=int(publish_time_ns),
+            data=payload,
+            sequence=int(self._event_sequence),
         )
 
     def close(self) -> None:

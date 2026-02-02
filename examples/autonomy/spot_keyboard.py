@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from lca_stack.ipc import JsonlClient, make_header
+    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
 except ModuleNotFoundError:
     REPO_ROOT = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(REPO_ROOT / "src"))
-    from lca_stack.ipc import JsonlClient, make_header
+    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,7 @@ def _teleop_loop(stdscr: Any, *, host: str, port: int, agent_id: str) -> None:
     curses.curs_set(0)
 
     teleop = KeyboardTeleop(TeleopLimits())
+    handshake: Handshake | None = None
     run_id: str | None = None
     seq = 0
 
@@ -158,9 +159,14 @@ def _teleop_loop(stdscr: Any, *, host: str, port: int, agent_id: str) -> None:
                     client.close()
                     client = None
                 else:
-                    maybe_run_id = _extract_run_id(msg)
-                    if maybe_run_id is not None:
-                        run_id = maybe_run_id
+                    hs = extract_handshake(msg)
+                    if hs is not None:
+                        handshake = hs
+                        run_id = hs.run_id
+                    else:
+                        maybe_run_id = _extract_run_id(msg)
+                        if maybe_run_id is not None:
+                            run_id = maybe_run_id
             except Exception:
                 # Timeout or transient read issue: keep waiting.
                 pass
@@ -170,6 +176,7 @@ def _teleop_loop(stdscr: Any, *, host: str, port: int, agent_id: str) -> None:
             vx, vy, wz = teleop.poll(now_s)
             seq += 1
             cmd_msg = {
+                "topic": "local/autonomy/actuation_request",
                 "header": make_header(run_id, agent_id, seq),
                 "kind": "spot_cmd_vel_v1",
                 "vx_mps": vx,
@@ -198,10 +205,12 @@ def _teleop_loop(stdscr: Any, *, host: str, port: int, agent_id: str) -> None:
             stdscr.addstr(6, 0, "Waiting for daemon connection... (press q to quit)")
         elif run_id is None:
             stdscr.addstr(4, 0, f"Daemon: CONNECTED ({host}:{port})")
-            stdscr.addstr(6, 0, "Waiting for first observation to learn run_id... (press q to quit)")
+            stdscr.addstr(6, 0, "Waiting for daemon handshake to learn run_id... (press q to quit)")
         else:
             vx, vy, wz = teleop.poll(now_s)
             stdscr.addstr(1, 0, f"run_id:  {run_id}")
+            if handshake is not None:
+                stdscr.addstr(2, 0, f"protocol: v{handshake.protocol_version}  ports: adapter={handshake.adapter_port} autonomy={handshake.autonomy_port}")
             stdscr.addstr(4, 0, f"desired vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  wz={wz:+.2f} rad/s")
             stdscr.addstr(6, 0, "Help:")
             for i, line in enumerate(HELP):

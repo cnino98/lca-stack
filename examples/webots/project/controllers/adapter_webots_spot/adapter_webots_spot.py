@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,11 +16,11 @@ from Bezier import BezierGait, GaitTiming, PhaseOffsets
 from SpotKinematics import SpotModel
 
 try:
-    from lca_stack.ipc import JsonlClient, make_header
+    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
 except ModuleNotFoundError:
     REPO_ROOT = Path(__file__).resolve().parents[5]
     sys.path.insert(0, str(REPO_ROOT / "src"))
-    from lca_stack.ipc import JsonlClient, make_header
+    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
 
 
 MOTOR_NAMES = (
@@ -238,8 +239,17 @@ class SpotAdapterController:
         self._gait = BezierGait(dt=self._dt, timing=GaitTiming(swing_time=0.30), offsets=PhaseOffsets())
         self._mapper = GaitMapper(self._teleop_limits, self._gait_cfg)
 
+        # The daemon owns run_id. We fall back to a random UUID only if the
+        # handshake is not received (should not happen in normal operation).
         self._run_id = str(uuid.uuid4())
         self._seq = 0
+
+        hs = self._read_daemon_handshake(timeout_s=2.0)
+        if hs is not None:
+            self._run_id = str(hs.run_id)
+            # The daemon is the source of truth for agent_id.
+            if hs.agent_id:
+                self._agent_id = str(hs.agent_id)
 
         self._base_foot = self._spot.body_to_foot_home
         self._body_pos = np.zeros(3, dtype=float)
@@ -294,6 +304,7 @@ class SpotAdapterController:
     ) -> None:
         self._seq += 1
         obs = {
+            "topic": "local/adapter/observation",
             "header": make_header(self._run_id, self._agent_id, self._seq),
             "kind": "spot_obs_v1",
             "sim_time_s": sim_time_s,
@@ -307,6 +318,37 @@ class SpotAdapterController:
             },
         }
         self._daemon_link.write_json(obs)
+
+    def _read_daemon_handshake(self, timeout_s: float) -> Handshake | None:
+        """Read the daemon handshake if available.
+
+        The daemon sends a handshake as the first message on each connection.
+        We use it to learn the daemon-generated run_id.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+
+            try:
+                self._daemon_link.set_timeout(float(remaining))
+                msg = self._daemon_link.read_json()
+            except Exception:
+                continue
+            finally:
+                try:
+                    self._daemon_link.set_timeout(None)
+                except Exception:
+                    pass
+
+            if msg is None:
+                return None
+            hs = extract_handshake(msg)
+            if hs is not None:
+                return hs
+
+        return None
 
 
 def main() -> None:
