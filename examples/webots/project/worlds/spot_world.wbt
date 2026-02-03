@@ -35,5 +35,5 @@ Spot {
 UnevenTerrain {
   translation 0 0 -6.25
   size 100 100 10
-  perlinNOctaves 10
+  perlinNOctaves 9
 }

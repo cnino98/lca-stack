@@ -1,25 +1,36 @@
 from __future__ import annotations
 
-import json
 import logging
 import socket
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping, cast
+from typing import Any, MutableMapping
 
-from lca_stack.ipc import MonotonicWallClock, make_header, now_mono_ns, now_wall_ns, try_extract_header_from_obj
-from lca_stack.ipc.jsonl import JsonlSocket
-from lca_stack.ipc.protocol import PROTOCOL_VERSION, dumps_json, make_handshake, make_run_event
+from lca_stack.daemon.safety import SafetyGuard
+from lca_stack.ipc import MonotonicWallClock, now_mono_ns, now_wall_ns
+from lca_stack.ipc.framing import FramedSocket
+from lca_stack.ipc.protocol import (
+    PROTOCOL_VERSION,
+    HandshakeResult,
+    daemon_handshake,
+    make_actuation_envelope,
+    make_event_envelope,
+    make_status_envelope,
+)
+from lca_stack.ipc.validate import ValidationError, validate_envelope
 from lca_stack.log.mcap_logger import (
     TOPIC_ACTUATION,
     TOPIC_ACTUATION_REQUEST,
     TOPIC_OBSERVATION,
     TOPIC_RUN_EVENT,
     McapLogger,
+    topic_status,
 )
 from lca_stack.run import ClockSnapshot, build_manifest_start, finalize_manifest, write_manifest
+from lca_stack.proto import lca_stack_pb2 as pb
 
 from .server import Listeners, accept_one, listen_pair
 
@@ -28,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 _CLOCK_SPREAD_WARN_NS = 50_000_000  # 50 ms
 _MONO_JUMP_WARN_NS = 5_000_000_000  # 5 s
+_STATUS_PERIOD_S = 0.2
 
 
 @dataclass(slots=True)
@@ -63,18 +75,18 @@ class _TimeSanityChecker:
         self._warned_backward: set[tuple[str, str]] = set()
         self._warned_jump: set[tuple[str, str]] = set()
 
-    def check(self, *, agent_id: str, topic: str, t_mono_ns: int, emit: callable) -> None:
-        key = (str(agent_id), str(topic))
+    def check(self, *, sender: str, topic: str, t_mono_ns: int, emit_event: callable) -> None:
+        key = (str(sender), str(topic))
         prev = self._last_mono_ns.get(key)
         if prev is not None:
             if int(t_mono_ns) < int(prev) and key not in self._warned_backward:
                 self._warned_backward.add(key)
-                emit(
-                    level="WARNING",
-                    event="time_monotonic_backward",
+                emit_event(
+                    "time_monotonic_backward",
+                    severity=pb.SEVERITY_WARNING,
                     message="origin monotonic time went backward (non-decreasing expected)",
-                    fields={
-                        "agent_id": str(agent_id),
+                    data={
+                        "sender": str(sender),
                         "topic": str(topic),
                         "prev_t_mono_ns": int(prev),
                         "t_mono_ns": int(t_mono_ns),
@@ -82,12 +94,12 @@ class _TimeSanityChecker:
                 )
             if int(t_mono_ns) - int(prev) > _MONO_JUMP_WARN_NS and key not in self._warned_jump:
                 self._warned_jump.add(key)
-                emit(
-                    level="WARNING",
-                    event="time_monotonic_jump",
+                emit_event(
+                    "time_monotonic_jump",
+                    severity=pb.SEVERITY_WARNING,
                     message="origin monotonic time jumped forward (large gap)",
-                    fields={
-                        "agent_id": str(agent_id),
+                    data={
+                        "sender": str(sender),
                         "topic": str(topic),
                         "prev_t_mono_ns": int(prev),
                         "t_mono_ns": int(t_mono_ns),
@@ -102,7 +114,8 @@ class _Link:
     role: str
     sock: socket.socket
     addr: tuple[str, int]
-    link: JsonlSocket
+    link: FramedSocket
+    handshake: HandshakeResult
 
 
 def run_bridge(
@@ -115,8 +128,7 @@ def run_bridge(
     scenario: str | None,
     seed: int | None,
 ) -> None:
-    # Daemon invocation == one run. The daemon owns the run_id and communicates it
-    # to Adapter and Autonomy via an immediate handshake.
+    # Daemon invocation == one run. The daemon owns the run_id.
     run_id = str(uuid.uuid4())
 
     wall_clock = MonotonicWallClock()
@@ -133,14 +145,17 @@ def run_bridge(
             autonomy_port=autonomy_port,
             scenario=scenario,
             seed=seed,
-            wall_clock=wall_clock,
-            mcap=mcap,
         )
     finally:
         try:
             listeners.adapter_listener.close()
         finally:
             listeners.autonomy_listener.close()
+
+    # Both local links must agree on schema version.
+    schema_version = int(links["adapter"].handshake.schema_version)
+    if int(links["autonomy"].handshake.schema_version) != int(schema_version):
+        raise RuntimeError("schema version mismatch between adapter and autonomy")
 
     manifest_path = Path(runs_dir) / run_id / "manifest.yaml"
 
@@ -158,7 +173,8 @@ def run_bridge(
         adapter_port=adapter_port,
         autonomy_port=autonomy_port,
         protocol_version=int(PROTOCOL_VERSION),
-        start_wall_ns=start_wall_ns,
+        schema_version=int(schema_version),
+        start_wall_ns=int(start_wall_ns),
         scenario=scenario,
         seed=seed,
         clock=clock_snapshot,
@@ -169,11 +185,7 @@ def run_bridge(
     bridge = _AgentBridge(
         run_id=run_id,
         agent_id=agent_id,
-        host=host,
-        adapter_port=adapter_port,
-        autonomy_port=autonomy_port,
-        scenario=scenario,
-        seed=seed,
+        schema_version=int(schema_version),
         wall_clock=wall_clock,
         mcap=mcap,
         adapter_link=links["adapter"],
@@ -181,11 +193,11 @@ def run_bridge(
     )
 
     try:
-        bridge.emit_run_start()
+        bridge.emit_event("run_start")
         bridge.run()
     finally:
         try:
-            bridge.emit_run_stop()
+            bridge.emit_event("run_stop")
         finally:
             end_wall_ns = int(now_wall_ns())
             final = finalize_manifest(manifest, end_wall_ns=end_wall_ns, clock_health=bridge.clock_health_snapshot())
@@ -202,45 +214,33 @@ def _accept_links_with_handshake(
     autonomy_port: int,
     scenario: str | None,
     seed: int | None,
-    wall_clock: MonotonicWallClock,
-    mcap: McapLogger,
 ) -> dict[str, _Link]:
     out: dict[str, _Link] = {}
-    lock = threading.Lock()
 
-    def _accept(role: str, listener: socket.socket) -> None:
+    def _accept(role: str, listener: socket.socket) -> _Link:
         sock, addr = accept_one(listener)
-        link = JsonlSocket(sock)
-
-        hs = make_handshake(
-            run_id=run_id,
-            agent_id=agent_id,
-            role=role,
-            adapter_port=adapter_port,
-            autonomy_port=autonomy_port,
+        link = FramedSocket(sock)
+        hs = daemon_handshake(
+            link=link,
+            role=str(role),
+            run_id=str(run_id),
+            agent_id=str(agent_id),
+            adapter_port=int(adapter_port),
+            autonomy_port=int(autonomy_port),
             scenario=scenario,
             seed=seed,
         )
-        _ensure_origin_fields(hs, origin_agent_id=agent_id, origin_seq=int(hs["header"]["seq"]), origin_topic=TOPIC_RUN_EVENT)
-        hs_line = dumps_json(hs)
-        link.write_line(hs_line)
-        _log_event_payload(mcap=mcap, wall_clock=wall_clock, payload_line=hs_line, publish_time_ns=int(hs["header"]["t_wall_ns"]))
-        logger.info("accepted %s from %s:%s", role, addr[0], addr[1])
-        with lock:
-            out[role] = _Link(role=role, sock=sock, addr=addr, link=link)
+        return _Link(role=str(role), sock=sock, addr=addr, link=link, handshake=hs)
 
-    t_adapter = threading.Thread(target=_accept, name="accept-adapter", args=("adapter", listeners.adapter_listener), daemon=True)
-    t_autonomy = threading.Thread(target=_accept, name="accept-autonomy", args=("autonomy", listeners.autonomy_listener), daemon=True)
-    t_adapter.start()
-    t_autonomy.start()
-    t_adapter.join()
-    t_autonomy.join()
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="accept") as pool:
+        fut_adapter = pool.submit(_accept, "adapter", listeners.adapter_listener)
+        fut_autonomy = pool.submit(_accept, "autonomy", listeners.autonomy_listener)
+        adapter_link = fut_adapter.result()
+        autonomy_link = fut_autonomy.result()
+
+    out["adapter"] = adapter_link
+    out["autonomy"] = autonomy_link
     return out
-
-
-def _log_event_payload(*, mcap: McapLogger, wall_clock: MonotonicWallClock, payload_line: str, publish_time_ns: int) -> None:
-    daemon_time_ns = int(wall_clock.now_wall_ns())
-    mcap.log_run_event(daemon_time_ns, int(publish_time_ns), payload_line.encode("utf-8"))
 
 
 class _AgentBridge:
@@ -249,11 +249,7 @@ class _AgentBridge:
         *,
         run_id: str,
         agent_id: str,
-        host: str,
-        adapter_port: int,
-        autonomy_port: int,
-        scenario: str | None,
-        seed: int | None,
+        schema_version: int,
         wall_clock: MonotonicWallClock,
         mcap: McapLogger,
         adapter_link: _Link,
@@ -261,400 +257,440 @@ class _AgentBridge:
     ) -> None:
         self._run_id = str(run_id)
         self._agent_id = str(agent_id)
-        self._host = str(host)
-        self._adapter_port = int(adapter_port)
-        self._autonomy_port = int(autonomy_port)
-        self._scenario = scenario
-        self._seed = seed
-
+        self._schema_version = int(schema_version)
         self._wall_clock = wall_clock
         self._mcap = mcap
+
         self._adapter = adapter_link
         self._autonomy = autonomy_link
-        self._send_lock_adapter = threading.Lock()
-        self._send_lock_autonomy = threading.Lock()
-        self._stop = threading.Event()
 
-        self._time_check = _TimeSanityChecker()
-        self._offset_stats: dict[str, _OffsetStats] = {
-            TOPIC_OBSERVATION: _OffsetStats(),
-            TOPIC_ACTUATION_REQUEST: _OffsetStats(),
+        self._stop = threading.Event()
+        self._adapter_tx_lock = threading.Lock()
+        self._autonomy_tx_lock = threading.Lock()
+
+        self._event_seq = 0
+        self._status_seq = 0
+        self._actuation_seq = 0
+
+        self._mode = pb.MODE_INIT
+        self._estop = False
+        self._faults: list[str] = []
+
+        self._last_adapter_wall_ns: int = 0
+        self._last_autonomy_wall_ns: int = 0
+        self._last_team_rx_wall_ns: int = 0
+        self._last_team_tx_wall_ns: int = 0
+
+        self._offset_stats: MutableMapping[str, _OffsetStats] = {
+            "adapter": _OffsetStats(),
+            "autonomy": _OffsetStats(),
         }
         self._clock_spread_warned = False
-        self._stop_reason: str | None = None
+        self._time_sanity = _TimeSanityChecker()
 
-        # Per-channel sequence numbers for daemon-injected headers.
-        self._inject_seq: dict[str, int] = {
-            TOPIC_OBSERVATION: 0,
-            TOPIC_ACTUATION_REQUEST: 0,
-            TOPIC_RUN_EVENT: 0,
-        }
+        self._safety = SafetyGuard(agent_id=self._agent_id)
 
-    def emit_run_start(self) -> None:
-        ev = make_run_event(
-            run_id=self._run_id,
-            agent_id=self._agent_id,
-            event="run_start",
-            level="INFO",
-            fields={
-                "host": self._host,
-                "ports": {"adapter": self._adapter_port, "autonomy": self._autonomy_port},
-                "scenario": self._scenario,
-                "seed": self._seed,
-                "protocol_version": int(PROTOCOL_VERSION),
-            },
-        )
-        self._broadcast_event(ev)
+        self._injected_seq: dict[str, int] = {"adapter": 0, "autonomy": 0}
 
-    def emit_run_stop(self) -> None:
-        fields: dict[str, Any] = {
-            "host": self._host,
-            "ports": {"adapter": self._adapter_port, "autonomy": self._autonomy_port},
-        }
-        if self._stop_reason is not None:
-            fields["reason"] = self._stop_reason
-
-        ev = make_run_event(
-            run_id=self._run_id,
-            agent_id=self._agent_id,
-            event="run_stop",
-            level="INFO",
-            fields=fields,
-        )
-        self._broadcast_event(ev)
-
-    def run(self) -> None:
-        t_obs = threading.Thread(target=self._relay_observation, name="relay-observation", daemon=True)
-        t_act = threading.Thread(target=self._relay_actuation, name="relay-actuation", daemon=True)
-
-        t_obs.start()
-        t_act.start()
-
-        t_obs.join()
-        t_act.join()
+        # Threads
+        self._threads: list[threading.Thread] = []
 
     def close(self) -> None:
-        for link in (self._adapter, self._autonomy):
-            try:
-                link.sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                link.sock.close()
-            except Exception:
-                pass
+        # Stop first, then close sockets to unblock any blocking recv() loops.
+        self._stop.set()
+
         try:
-            self._mcap.close()
+            self._adapter.link.close()
+        except Exception:
+            pass
+        try:
+            self._autonomy.link.close()
         except Exception:
             pass
 
-    def clock_health_snapshot(self) -> dict[str, Any]:
-        # Snapshot is intended for quick health debugging, not precise calibration.
-        offsets = {topic: stats.to_dict() for topic, stats in self._offset_stats.items()}
-
-        last_offsets = [
-            stats.last_offset_ns
-            for topic, stats in self._offset_stats.items()
-            if stats.count and topic in (TOPIC_OBSERVATION, TOPIC_ACTUATION_REQUEST)
-        ]
-        spread_ns: int | None = None
-        if last_offsets:
-            spread_ns = int(max(last_offsets) - min(last_offsets))
-
-        return {
-            "local_wall_ns": int(now_wall_ns()),
-            "local_mono_ns": int(now_mono_ns()),
-            "monotonic_wall_anchor_wall0_ns": int(self._wall_clock.wall0_ns),
-            "monotonic_wall_anchor_mono0_ns": int(self._wall_clock.mono0_ns),
-            "offsets": offsets,
-            "last_spread_ns": spread_ns,
-        }
-
-    def _relay_observation(self) -> None:
-        while not self._stop.is_set():
+        for t in self._threads:
             try:
-                line = self._adapter.link.read_line()
-            except Exception as e:
-                self._set_stop("adapter_disconnect")
-                self._emit_warning(
-                    "disconnect",
-                    "adapter link error; treating as disconnect",
-                    fields={"error": repr(e)},
-                )
-                break
-            if line is None:
-                self._set_stop("adapter_disconnect")
-                self._emit_warning("disconnect", "adapter disconnected")
-                break
+                t.join(timeout=1.0)
+            except Exception:
+                pass
 
-            msg = self._parse_message(line, inferred_topic=TOPIC_OBSERVATION, source_role="adapter")
-            if msg is None:
-                continue
+        self._mcap.close()
 
-            # Log and forward to autonomy.
-            payload_line = dumps_json(msg)
-            header = cast(Mapping[str, object], msg["header"])  # ensured by _parse_message
-            self._mcap.log_observation(
-                int(self._wall_clock.now_wall_ns()),
-                int(cast(int, header.get("t_wall_ns"))),
-                payload_line.encode("utf-8"),
-            )
-            with self._send_lock_autonomy:
-                self._autonomy.link.write_line(payload_line)
+    def run(self) -> None:
+        self._mode = pb.MODE_RUNNING
 
-    def _relay_actuation(self) -> None:
+        self.emit_event(
+            "link_connected",
+            data={"role": "adapter", "addr": f"{self._adapter.addr[0]}:{self._adapter.addr[1]}"},
+        )
+        self.emit_event(
+            "link_connected",
+            data={"role": "autonomy", "addr": f"{self._autonomy.addr[0]}:{self._autonomy.addr[1]}"},
+        )
+
+        t1 = threading.Thread(target=self._adapter_rx_loop, name="adapter-rx", daemon=True)
+        t2 = threading.Thread(target=self._autonomy_rx_loop, name="autonomy-rx", daemon=True)
+        t3 = threading.Thread(target=self._status_loop, name="status", daemon=True)
+
+        self._threads = [t1, t2, t3]
+        for t in self._threads:
+            t.start()
+
+        self._stop.wait()
+        self._mode = pb.MODE_STOPPED
+
+    def _status_loop(self) -> None:
+        import time
+
+        next_t = time.monotonic()
+        heartbeat_seq = 0
+
         while not self._stop.is_set():
-            try:
-                line = self._autonomy.link.read_line()
-            except Exception as e:
-                self._set_stop("autonomy_disconnect")
-                self._emit_warning(
-                    "disconnect",
-                    "autonomy link error; treating as disconnect",
-                    fields={"error": repr(e)},
-                )
-                break
-            if line is None:
-                self._set_stop("autonomy_disconnect")
-                self._emit_warning("disconnect", "autonomy disconnected")
-                break
-
-            req = self._parse_message(line, inferred_topic=TOPIC_ACTUATION_REQUEST, source_role="autonomy")
-            if req is None:
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(min(0.05, max(0.0, next_t - now)))
                 continue
+            next_t = now + _STATUS_PERIOD_S
 
-            # Log the request as-sent by autonomy.
-            req_line = dumps_json(req)
-            header = cast(Mapping[str, object], req["header"])  # ensured by _parse_message
-            self._mcap.log_actuation_request(
-                int(self._wall_clock.now_wall_ns()),
-                int(cast(int, header.get("t_wall_ns"))),
-                req_line.encode("utf-8"),
+            heartbeat_seq += 1
+            status = pb.Status(
+                mode=self._mode,
+                faults=list(self._faults),
+                estop=bool(self._estop),
+                heartbeat_seq=int(heartbeat_seq),
+                daemon_wall_ns=int(now_wall_ns()),
+                last_adapter_wall_ns=int(self._last_adapter_wall_ns),
+                last_autonomy_wall_ns=int(self._last_autonomy_wall_ns),
+                last_team_rx_wall_ns=int(self._last_team_rx_wall_ns),
+                last_team_tx_wall_ns=int(self._last_team_tx_wall_ns),
             )
 
-            # Apply safety later. For now, pass through but re-topic the message to reflect
-            # what the adapter actually receives.
-            act = dict(req)
-            act["topic"] = TOPIC_ACTUATION
-            act.setdefault("lca_meta", {})
-            if isinstance(act["lca_meta"], dict):
-                act["lca_meta"].setdefault("safety", {"applied": False})
+            self._status_seq += 1
+            env = make_status_envelope(run_id=self._run_id, agent_id=self._agent_id, seq=int(self._status_seq), status=status)
 
-            _ensure_origin_fields(
-                act,
-                origin_agent_id=str(act.get("origin_agent_id") or cast(str, cast(Mapping[str, object], act["header"]).get("agent_id"))),
-                origin_seq=int(act.get("origin_seq") or cast(int, cast(Mapping[str, object], act["header"]).get("seq"))),
-                origin_topic=str(act.get("origin_topic") or TOPIC_ACTUATION_REQUEST),
+            # Send locally to Autonomy (the adapter does not require daemon status).
+            self._send_to_autonomy(env)
+
+            self._mcap.log_status(
+                self._wall_clock.now_wall_ns(),
+                int(env.header.t_wall_ns),
+                env.SerializeToString(),
             )
 
-            act_line = dumps_json(act)
-            self._mcap.log_actuation(
-                int(self._wall_clock.now_wall_ns()),
-                int(cast(int, header.get("t_wall_ns"))),
-                act_line.encode("utf-8"),
-            )
-            with self._send_lock_adapter:
-                self._adapter.link.write_line(act_line)
+    def emit_event(
+        self,
+        event_type: str,
+        *,
+        severity: pb.Severity = pb.SEVERITY_INFO,
+        message: str | None = None,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        self._event_seq += 1
+        env = make_event_envelope(
+            run_id=self._run_id,
+            agent_id=self._agent_id,
+            seq=int(self._event_seq),
+            event_type=str(event_type),
+            severity=severity,
+            message=message,
+            data=data,
+        )
 
-    def _parse_message(self, line: str, *, inferred_topic: str, source_role: str) -> dict[str, Any] | None:
+        # Best-effort local broadcast.
+        self._send_to_autonomy(env)
+
+        self._mcap.log_run_event(
+            self._wall_clock.now_wall_ns(),
+            int(env.header.t_wall_ns),
+            env.SerializeToString(),
+        )
+
+    def _adapter_rx_loop(self) -> None:
         try:
-            parsed = json.loads(line)
-        except Exception as e:
-            self._emit_warning(
-                "invalid_json",
-                f"{source_role} sent invalid JSON; dropping",
-                fields={"error": repr(e)},
-            )
-            return None
-
-        if not isinstance(parsed, dict):
-            self._emit_warning(
-                "invalid_message",
-                f"{source_role} sent non-object JSON; dropping",
-                fields={"type": type(parsed).__name__},
-            )
-            return None
-
-        msg = cast(dict[str, Any], parsed)
-
-        # Standardize topic and provide an origin key for log alignment across agents.
-        self._ensure_topic(msg, inferred_topic=inferred_topic, source_role=source_role)
-        header_injected = self._ensure_header(msg, source_role=source_role, inferred_topic=inferred_topic)
-        header = cast(Mapping[str, object], msg["header"])
-
-        _ensure_origin_fields(
-            msg,
-            origin_agent_id=str(header.get("agent_id")),
-            origin_seq=int(cast(int, header.get("seq"))),
-            origin_topic=str(msg.get("topic")),
-        )
-
-        # Sanity checks / diagnostics.
-        self._time_check.check(
-            agent_id=str(header.get("agent_id")),
-            topic=str(msg.get("topic")),
-            t_mono_ns=int(cast(int, header.get("t_mono_ns"))),
-            emit=self._emit_event,
-        )
-        self._update_clock_offsets(
-            inferred_topic=str(msg.get("topic")),
-            t_wall_ns=int(cast(int, header.get("t_wall_ns"))),
-        )
-        if header_injected:
-            self._emit_warning(
-                "header_injected",
-                f"{source_role} message missing/invalid header; daemon injected a header",
-                fields={"topic": str(msg.get("topic"))},
-            )
-
-        return msg
-
-    def _ensure_topic(self, msg: MutableMapping[str, Any], *, inferred_topic: str, source_role: str) -> None:
-        existing = msg.get("topic")
-        if isinstance(existing, str) and existing:
-            if existing != inferred_topic:
-                # Keep a breadcrumb and normalize.
-                meta = msg.setdefault("lca_meta", {})
-                if isinstance(meta, dict):
-                    meta.setdefault("original_topic", existing)
-                    meta.setdefault("topic_normalized_by_daemon", True)
-                msg["topic"] = inferred_topic
-                self._emit_warning(
-                    "topic_mismatch",
-                    f"{source_role} message topic did not match expected; normalized",
-                    fields={"original": existing, "expected": inferred_topic},
+            while not self._stop.is_set():
+                env = pb.Envelope()
+                self._adapter.link.read_message(env)
+                self._handle_inbound(env, sender="adapter")
+        except EOFError:
+            if not self._stop.is_set():
+                self._fault("adapter_disconnected")
+                self.emit_event(
+                    "link_disconnected",
+                    severity=pb.SEVERITY_WARNING,
+                    data={"role": "adapter"},
                 )
+                self._stop.set()
+        except Exception as e:
+            # If we're shutting down, socket close/shutdown can surface as errors.
+            if not self._stop.is_set():
+                logger.exception("adapter rx failed")
+                self._fault("adapter_rx_error")
+                self.emit_event(
+                    "link_error",
+                    severity=pb.SEVERITY_ERROR,
+                    message=str(e),
+                    data={"role": "adapter"},
+                )
+                self._stop.set()
+
+    def _autonomy_rx_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                env = pb.Envelope()
+                self._autonomy.link.read_message(env)
+                self._handle_inbound(env, sender="autonomy")
+        except EOFError:
+            if not self._stop.is_set():
+                self._fault("autonomy_disconnected")
+                self.emit_event(
+                    "link_disconnected",
+                    severity=pb.SEVERITY_WARNING,
+                    data={"role": "autonomy"},
+                )
+                self._stop.set()
+        except Exception as e:
+            if not self._stop.is_set():
+                logger.exception("autonomy rx failed")
+                self._fault("autonomy_rx_error")
+                self.emit_event(
+                    "link_error",
+                    severity=pb.SEVERITY_ERROR,
+                    message=str(e),
+                    data={"role": "autonomy"},
+                )
+                self._stop.set()
+
+    def _handle_inbound(self, env: pb.Envelope, *, sender: str) -> None:
+        try:
+            validate_envelope(env, expected_schema_version=int(self._schema_version))
+        except ValidationError as e:
+            self.emit_event(
+                "invalid_message",
+                severity=pb.SEVERITY_WARNING,
+                message=str(e),
+                data={"sender": str(sender)},
+            )
             return
-        msg["topic"] = inferred_topic
 
-    def _ensure_header(self, msg: MutableMapping[str, Any], *, source_role: str, inferred_topic: str) -> bool:
-        header = try_extract_header_from_obj(cast(Mapping[str, object], msg))
-        if header is None:
-            # Inject a daemon header so logs remain usable.
-            self._inject_seq[inferred_topic] = int(self._inject_seq.get(inferred_topic, 0)) + 1
-            hdr = make_header(self._run_id, self._agent_id, seq=int(self._inject_seq[inferred_topic]))
-            msg["header"] = hdr
-            meta = msg.setdefault("lca_meta", {})
-            if isinstance(meta, dict):
-                meta["header_injected"] = True
-                meta["header_reason"] = "missing_or_invalid"
-            return True
+        self._normalize_env(env, sender=str(sender))
 
-        # Normalize run_id + agent_id to this daemon's configuration.
-        changed = False
-        header_obj = cast(dict[str, Any], cast(dict[str, Any], msg.get("header")))
-        if header.run_id != self._run_id:
-            header_obj["run_id"] = self._run_id
-            changed = True
-        if header.agent_id != self._agent_id:
-            header_obj["agent_id"] = self._agent_id
-            changed = True
-        if changed:
-            meta = msg.setdefault("lca_meta", {})
-            if isinstance(meta, dict):
-                meta.setdefault("header_normalized_by_daemon", True)
-        return False
+        # Update local clocks/health.
+        self._update_clock_health(env, sender=str(sender))
 
-    def _update_clock_offsets(self, *, inferred_topic: str, t_wall_ns: int) -> None:
-        daemon_recv_wall_ns = int(self._wall_clock.now_wall_ns())
-        offset_ns = int(daemon_recv_wall_ns - int(t_wall_ns))
-        stats = self._offset_stats.get(inferred_topic)
-        if stats is None:
-            stats = _OffsetStats()
-            self._offset_stats[inferred_topic] = stats
-        stats.update(offset_ns)
+        # Sanity-check monotonic time per sender+topic.
+        self._time_sanity.check(sender=str(sender), topic=str(env.topic), t_mono_ns=int(env.header.t_mono_ns), emit_event=self.emit_event)
 
-        obs = self._offset_stats[TOPIC_OBSERVATION]
-        act = self._offset_stats[TOPIC_ACTUATION_REQUEST]
-        if obs.count and act.count and not self._clock_spread_warned:
-            spread = int(max(obs.last_offset_ns, act.last_offset_ns) - min(obs.last_offset_ns, act.last_offset_ns))
-            if spread > _CLOCK_SPREAD_WARN_NS:
-                self._clock_spread_warned = True
-                self._emit_warning(
-                    "clock_spread",
-                    "observed wall-clock spread between local processes exceeds threshold",
-                    fields={
-                        "spread_ns": spread,
-                        "threshold_ns": _CLOCK_SPREAD_WARN_NS,
-                        "offsets_ns": {
-                            TOPIC_OBSERVATION: obs.last_offset_ns,
-                            TOPIC_ACTUATION_REQUEST: act.last_offset_ns,
-                        },
+        payload = env.WhichOneof("payload")
+        if sender == "adapter":
+            if payload == "observation":
+                self._last_adapter_wall_ns = int(env.header.t_wall_ns)
+                self._mcap.log_observation(
+                    self._wall_clock.now_wall_ns(),
+                    int(env.header.t_wall_ns),
+                    env.SerializeToString(),
+                )
+                # Forward observations to autonomy.
+                self._send_to_autonomy(env)
+            elif payload == "event":
+                # Adapter-side events are forwarded + logged.
+                self._mcap.log_run_event(self._wall_clock.now_wall_ns(), int(env.header.t_wall_ns), env.SerializeToString())
+                self._send_to_autonomy(env)
+            else:
+                # Ignore unexpected payloads from adapter for now.
+                return
+
+        elif sender == "autonomy":
+            if payload == "actuation_request":
+                self._last_autonomy_wall_ns = int(env.header.t_wall_ns)
+
+                # Always log the request.
+                self._mcap.log_actuation_request(
+                    self._wall_clock.now_wall_ns(),
+                    int(env.header.t_wall_ns),
+                    env.SerializeToString(),
+                )
+
+                decision = self._safety.evaluate(mode=self._mode, estop=self._estop, req_env=env)
+
+                # Emit event(s) for interventions.
+                if decision.event_type is not None:
+                    self.emit_event(
+                        decision.event_type,
+                        severity=pb.SEVERITY_WARNING,
+                        data=dict(decision.event_data or {}),
+                    )
+
+                # Produce final actuation envelope (preserving origin identity for alignment).
+                self._actuation_seq += 1
+                act_env = make_actuation_envelope(
+                    run_id=self._run_id,
+                    agent_id=self._agent_id,
+                    seq=int(self._actuation_seq),
+                    kind=str(env.kind),
+                    data=dict(decision.final_data),
+                    safety_applied=bool(decision.safety_applied),
+                    safety_reason=str(decision.safety_reason),
+                    origin_agent_id=str(env.origin_agent_id),
+                    origin_seq=int(env.origin_seq),
+                    origin_topic=str(env.origin_topic),
+                    publish_time_ns=int(now_wall_ns()),
+                )
+
+                # Send to adapter and log final actuation.
+                self._send_to_adapter(act_env)
+                self._mcap.log_actuation(
+                    self._wall_clock.now_wall_ns(),
+                    int(act_env.header.t_wall_ns),
+                    act_env.SerializeToString(),
+                )
+
+            elif payload == "command":
+                # Local team-level commands are reflected as events for now.
+                cmd = env.command
+                self.emit_event(
+                    "command_received",
+                    data={
+                        "command_type": str(cmd.command_type),
+                        "target_agent_id": str(cmd.target_agent_id),
+                        "target_group": str(cmd.target_group),
                     },
                 )
 
-    def _emit_warning(self, event: str, message: str, *, fields: dict[str, Any] | None = None) -> None:
-        self._emit_event(level="WARNING", event=event, message=message, fields=fields)
+                if str(cmd.command_type).lower() in ("estop", "team_stop"):
+                    self._estop = True
+                    self.emit_event("estop_latched", severity=pb.SEVERITY_ERROR)
 
-    def _emit_event(self, *, level: str, event: str, message: str, fields: dict[str, Any] | None = None) -> None:
-        ev = make_run_event(
-            run_id=self._run_id,
-            agent_id=self._agent_id,
-            event=event,
-            level=level,
-            message=message,
-            fields=fields,
-        )
-        self._broadcast_event(ev)
+            elif payload == "event":
+                # Forward autonomy-generated events to adapter (optional) + log.
+                self._mcap.log_run_event(self._wall_clock.now_wall_ns(), int(env.header.t_wall_ns), env.SerializeToString())
+                # For now, keep daemon->adapter traffic minimal.
+            else:
+                return
 
-    def _broadcast_event(self, ev: dict[str, Any]) -> None:
-        # Always normalize and ensure origin fields for events.
-        ev["topic"] = TOPIC_RUN_EVENT
-
-        header_obj = ev.get("header")
-        if not isinstance(header_obj, dict):
-            self._inject_seq[TOPIC_RUN_EVENT] = int(self._inject_seq.get(TOPIC_RUN_EVENT, 0)) + 1
-            ev["header"] = make_header(self._run_id, self._agent_id, seq=int(self._inject_seq[TOPIC_RUN_EVENT]))
-        header_obj = cast(Mapping[str, object], cast(dict[str, Any], ev["header"]))
-        _ensure_origin_fields(
-            ev,
-            origin_agent_id=str(header_obj.get("agent_id")),
-            origin_seq=int(cast(int, header_obj.get("seq"))),
-            origin_topic=TOPIC_RUN_EVENT,
-        )
-
-        line = dumps_json(ev)
-        _log_event_payload(
-            mcap=self._mcap,
-            wall_clock=self._wall_clock,
-            payload_line=line,
-            publish_time_ns=int(cast(int, header_obj.get("t_wall_ns"))),
-        )
-
-        with self._send_lock_adapter:
+    def _send_to_adapter(self, env: pb.Envelope) -> None:
+        with self._adapter_tx_lock:
             try:
-                self._adapter.link.write_line(line)
+                self._adapter.link.write_message(env)
             except Exception:
+                # Best-effort.
                 pass
-        with self._send_lock_autonomy:
+
+    def _send_to_autonomy(self, env: pb.Envelope) -> None:
+        with self._autonomy_tx_lock:
             try:
-                self._autonomy.link.write_line(line)
+                self._autonomy.link.write_message(env)
             except Exception:
                 pass
 
-    def _set_stop(self, reason: str) -> None:
-        if self._stop_reason is None:
-            self._stop_reason = str(reason)
-        self._stop.set()
+    def _fault(self, fault: str) -> None:
+        if str(fault) not in self._faults:
+            self._faults.append(str(fault))
 
-        # Unblock any threads stuck in read_line() by shutting down both sockets.
-        for link in (self._adapter, self._autonomy):
-            try:
-                link.sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
+    def _normalize_env(self, env: pb.Envelope, *, sender: str) -> None:
+        """Normalize inbound envelopes for logging + routing.
 
+        - Inject missing header
+        - Force run_id/agent_id
+        - Standardize topics for known payloads
+        - Ensure origin identity is present
+        """
 
-def _ensure_origin_fields(
-    msg: MutableMapping[str, Any],
-    *,
-    origin_agent_id: str,
-    origin_seq: int,
-    origin_topic: str,
-) -> None:
-    if not isinstance(msg.get("origin_agent_id"), str) or not msg.get("origin_agent_id"):
-        msg["origin_agent_id"] = str(origin_agent_id)
-    if not isinstance(msg.get("origin_seq"), int):
-        msg["origin_seq"] = int(origin_seq)
-    if not isinstance(msg.get("origin_topic"), str) or not msg.get("origin_topic"):
-        msg["origin_topic"] = str(origin_topic)
+        # Standardize topic based on payload.
+        payload = env.WhichOneof("payload")
+        expected_topic = None
+        if payload == "observation":
+            expected_topic = TOPIC_OBSERVATION
+        elif payload == "actuation_request":
+            expected_topic = TOPIC_ACTUATION_REQUEST
+        elif payload == "actuation":
+            expected_topic = TOPIC_ACTUATION
+        elif payload == "status":
+            expected_topic = topic_status(self._agent_id)
+        elif payload == "event":
+            expected_topic = TOPIC_RUN_EVENT
+
+        if expected_topic is not None and str(env.topic) != str(expected_topic):
+            if not env.topic_normalized:
+                env.topic_original = str(env.topic)
+            env.topic = str(expected_topic)
+            env.topic_normalized = True
+
+        # Inject header if missing.
+        if not env.header.run_id and not env.header.agent_id and int(env.header.t_wall_ns) == 0 and int(env.header.t_mono_ns) == 0:
+            self._injected_seq[sender] = int(self._injected_seq.get(sender, 0)) + 1
+            injected = pb.Header(
+                run_id=str(self._run_id),
+                agent_id=str(self._agent_id),
+                seq=int(self._injected_seq[sender]),
+                t_mono_ns=int(now_mono_ns()),
+                t_wall_ns=int(now_wall_ns()),
+            )
+            env.header.CopyFrom(injected)
+            env.header_injected = True
+            env.header_injected_reason = "missing_header"
+
+        # Force run_id/agent_id to the daemon's run/agent.
+        if str(env.header.run_id) and str(env.header.run_id) != str(self._run_id):
+            env.header_injected = True
+            env.header_injected_reason = (env.header_injected_reason + ";" if env.header_injected_reason else "") + "run_id_override"
+            env.header.run_id = str(self._run_id)
+
+        if str(env.header.agent_id) and str(env.header.agent_id) != str(self._agent_id):
+            env.header_injected = True
+            env.header_injected_reason = (env.header_injected_reason + ";" if env.header_injected_reason else "") + "agent_id_override"
+            env.header.agent_id = str(self._agent_id)
+
+        # Ensure origin identity exists.
+        if not env.origin_agent_id:
+            env.origin_agent_id = str(env.header.agent_id)
+        if int(env.origin_seq) == 0:
+            env.origin_seq = int(env.header.seq)
+        if not env.origin_topic:
+            env.origin_topic = str(env.topic)
+
+    def _update_clock_health(self, env: pb.Envelope, *, sender: str) -> None:
+        if int(env.header.t_wall_ns) == 0:
+            return
+        offset_ns = int(now_wall_ns()) - int(env.header.t_wall_ns)
+        stats = self._offset_stats.get(sender)
+        if stats is not None:
+            stats.update(int(offset_ns))
+
+        # Spread across senders (adapter vs autonomy). This is a diagnostic proxy until multi-agent exists.
+        offsets: list[int] = []
+        for s in ("adapter", "autonomy"):
+            st = self._offset_stats.get(s)
+            if st is not None and st.count:
+                offsets.append(int(st.last_offset_ns))
+        if len(offsets) >= 2:
+            spread = int(max(offsets) - min(offsets))
+            if spread > _CLOCK_SPREAD_WARN_NS and not self._clock_spread_warned:
+                self._clock_spread_warned = True
+                self.emit_event(
+                    "clock_spread_warning",
+                    severity=pb.SEVERITY_WARNING,
+                    message="observed wall-clock offset spread across local processes",
+                    data={
+                        "spread_ns": int(spread),
+                        "threshold_ns": int(_CLOCK_SPREAD_WARN_NS),
+                        "offsets": {k: v.to_dict() for k, v in self._offset_stats.items()},
+                    },
+                )
+
+    def clock_health_snapshot(self) -> dict[str, Any]:
+        offsets = {k: v.to_dict() for k, v in self._offset_stats.items()}
+        spreads = [v.to_dict().get("spread_ns") for v in self._offset_stats.values() if v.count]
+        spread_ns = int(max(int(s or 0) for s in spreads)) if spreads else None
+        return {
+            "snapshot_wall_ns": int(now_wall_ns()),
+            "snapshot_mono_ns": int(now_mono_ns()),
+            "offsets": offsets,
+            "max_observed_spread_ns": spread_ns,
+            "topic": {
+                "observation": TOPIC_OBSERVATION,
+                "actuation_request": TOPIC_ACTUATION_REQUEST,
+                "actuation": TOPIC_ACTUATION,
+                "run_event": TOPIC_RUN_EVENT,
+                "status": topic_status(self._agent_id),
+            },
+        }

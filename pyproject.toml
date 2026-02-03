@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = { text = "AGPL-3.0-only" }
 dependencies = [
   "mcap>=1.3.0",
+  "protobuf>=6.31.1",
 ]
 
 authors = [
@@ -41,6 +42,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["lca_stack.vendor*"]
 
 [tool.setuptools.package-data]
 lca_stack = ["py.typed"]
@@ -51,5 +53,6 @@ strict = true
 warn_unused_configs = true
 mypy_path = "src"
 files = ["src"]
-exclude = '(?x)(^examples/|^runs/|^venv/|^\.venv/)'
+# Ignore local-only demos, run artifacts, and optional vendored deps (if present).
+exclude = '(?x)(^examples/|^runs/|^venv/|^\.venv/|^src/lca_stack/vendor/)'
 show_error_codes = true

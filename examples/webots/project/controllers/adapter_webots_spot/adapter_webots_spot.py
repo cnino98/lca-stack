@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +16,15 @@ from Bezier import BezierGait, GaitTiming, PhaseOffsets
 from SpotKinematics import SpotModel
 
 try:
-    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
+    from lca_stack.ipc import FramedClient, client_handshake, make_observation_envelope
+    from lca_stack.ipc.structs import struct_to_dict
+    from lca_stack.proto import lca_stack_pb2 as pb
 except ModuleNotFoundError:
     REPO_ROOT = Path(__file__).resolve().parents[5]
     sys.path.insert(0, str(REPO_ROOT / "src"))
-    from lca_stack.ipc import Handshake, JsonlClient, extract_handshake, make_header
+    from lca_stack.ipc import FramedClient, client_handshake, make_observation_envelope
+    from lca_stack.ipc.structs import struct_to_dict
+    from lca_stack.proto import lca_stack_pb2 as pb
 
 
 MOTOR_NAMES = (
@@ -115,7 +119,7 @@ class MotorGroup:
 class DaemonVelocitySource:
     """Reads the latest velocity command from the LCA daemon (non-blocking)."""
 
-    def __init__(self, link: JsonlClient, limits: TeleopLimits) -> None:
+    def __init__(self, link: object, limits: TeleopLimits) -> None:
         self._link = link
         self._limits = limits
         self._desired = VelocityCommand(0.0, 0.0, 0.0)
@@ -126,31 +130,33 @@ class DaemonVelocitySource:
 
     def _drain_incoming_commands(self) -> None:
         try:
-            self._link.set_timeout(0.0)
+            getattr(self._link, "set_timeout")(0.0)
             while True:
-                msg = self._link.read_json()
-                if msg is None:
-                    return  # EOF; let caller continue stepping until Webots exits
-                self._apply_message(msg)
+                env = pb.Envelope()
+                getattr(self._link, "read_message")(env)
+                self._apply_envelope(env)
+        except (BlockingIOError, socket.timeout):
+            return
+        except EOFError:
+            return
         except Exception:
-            # No more buffered data (timeout / would-block / etc).
             return
         finally:
             try:
-                self._link.set_timeout(None)
+                getattr(self._link, "set_timeout")(None)
             except Exception:
                 pass
 
-    def _apply_message(self, msg: Any) -> None:
-        if not isinstance(msg, dict):
+    def _apply_envelope(self, env: pb.Envelope) -> None:
+        if env.WhichOneof("payload") != "actuation":
             return
-        kind = msg.get("kind")
-        if kind != "spot_cmd_vel_v1":
+        if str(env.kind) != "spot_cmd_vel_v1":
             return
+        data = struct_to_dict(env.actuation.data)
 
-        vx = _clamp(float(msg.get("vx_mps", self._desired.vx)), -self._limits.max_vx, self._limits.max_vx)
-        vy = _clamp(float(msg.get("vy_mps", self._desired.vy)), -self._limits.max_vy, self._limits.max_vy)
-        wz = _clamp(float(msg.get("wz_rps", self._desired.wz)), -self._limits.max_wz, self._limits.max_wz)
+        vx = _clamp(float(data.get("vx_mps", self._desired.vx)), -self._limits.max_vx, self._limits.max_vx)
+        vy = _clamp(float(data.get("vy_mps", self._desired.vy)), -self._limits.max_vy, self._limits.max_vy)
+        wz = _clamp(float(data.get("wz_rps", self._desired.wz)), -self._limits.max_wz, self._limits.max_wz)
         self._desired = VelocityCommand(vx=vx, vy=vy, wz=wz)
 
 
@@ -229,7 +235,9 @@ class SpotAdapterController:
         self._filter_cfg = MotionFilter()
         self._gait_cfg = GaitLimits()
 
-        self._daemon_link = JsonlClient(daemon_host, daemon_port)
+        # Protobuf IPC: connect + negotiate schema via framed handshake.
+        client = FramedClient(str(daemon_host), int(daemon_port))
+        self._daemon_link = client.connect()
         self._command_source = DaemonVelocitySource(self._daemon_link, self._teleop_limits)
         self._limiter = CommandLimiter(self._filter_cfg)
 
@@ -239,17 +247,18 @@ class SpotAdapterController:
         self._gait = BezierGait(dt=self._dt, timing=GaitTiming(swing_time=0.30), offsets=PhaseOffsets())
         self._mapper = GaitMapper(self._teleop_limits, self._gait_cfg)
 
-        # The daemon owns run_id. We fall back to a random UUID only if the
-        # handshake is not received (should not happen in normal operation).
+        # Daemon owns run_id and canonical agent_id.
         self._run_id = str(uuid.uuid4())
         self._seq = 0
-
-        hs = self._read_daemon_handshake(timeout_s=2.0)
-        if hs is not None:
+        try:
+            hs = client_handshake(link=self._daemon_link, role="adapter")
             self._run_id = str(hs.run_id)
-            # The daemon is the source of truth for agent_id.
             if hs.agent_id:
                 self._agent_id = str(hs.agent_id)
+        except Exception:
+            # If handshake fails, keep a fallback run_id. The daemon will still
+            # normalize run_id/agent_id and may inject headers.
+            pass
 
         self._base_foot = self._spot.body_to_foot_home
         self._body_pos = np.zeros(3, dtype=float)
@@ -303,52 +312,27 @@ class SpotAdapterController:
         step_speed: float,
     ) -> None:
         self._seq += 1
-        obs = {
-            "topic": "local/adapter/observation",
-            "header": make_header(self._run_id, self._agent_id, self._seq),
-            "kind": "spot_obs_v1",
-            "sim_time_s": sim_time_s,
-            "desired": {"vx_mps": desired.vx, "vy_mps": desired.vy, "wz_rps": desired.wz},
-            "cmd": {"vx_mps": cmd.vx, "vy_mps": cmd.vy, "wz_rps": cmd.wz},
-            "gait": {
-                "half_stride": half_stride,
-                "lateral_fraction": lateral_fraction,
-                "yaw_rate": yaw_rate,
-                "step_speed": step_speed,
+        env = make_observation_envelope(
+            run_id=self._run_id,
+            agent_id=self._agent_id,
+            seq=int(self._seq),
+            kind="spot_obs_v1",
+            data={
+                "sim_time_s": float(sim_time_s),
+                "desired": {"vx_mps": float(desired.vx), "vy_mps": float(desired.vy), "wz_rps": float(desired.wz)},
+                "cmd": {"vx_mps": float(cmd.vx), "vy_mps": float(cmd.vy), "wz_rps": float(cmd.wz)},
+                "gait": {
+                    "half_stride": float(half_stride),
+                    "lateral_fraction": float(lateral_fraction),
+                    "yaw_rate": float(yaw_rate),
+                    "step_speed": float(step_speed),
+                },
             },
-        }
-        self._daemon_link.write_json(obs)
-
-    def _read_daemon_handshake(self, timeout_s: float) -> Handshake | None:
-        """Read the daemon handshake if available.
-
-        The daemon sends a handshake as the first message on each connection.
-        We use it to learn the daemon-generated run_id.
-        """
-        deadline = time.monotonic() + float(timeout_s)
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                break
-
-            try:
-                self._daemon_link.set_timeout(float(remaining))
-                msg = self._daemon_link.read_json()
-            except Exception:
-                continue
-            finally:
-                try:
-                    self._daemon_link.set_timeout(None)
-                except Exception:
-                    pass
-
-            if msg is None:
-                return None
-            hs = extract_handshake(msg)
-            if hs is not None:
-                return hs
-
-        return None
+        )
+        try:
+            getattr(self._daemon_link, "write_message")(env)
+        except Exception:
+            return
 
 
 def main() -> None:

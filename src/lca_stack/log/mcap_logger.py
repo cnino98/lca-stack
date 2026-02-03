@@ -4,13 +4,43 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol, Self, cast
 
+from google.protobuf import descriptor_pb2
+
+from lca_stack.proto import lca_stack_pb2 as pb
+
 TOPIC_OBSERVATION = "local/adapter/observation"
 TOPIC_ACTUATION_REQUEST = "local/autonomy/actuation_request"
 TOPIC_ACTUATION = "local/adapter/actuation"
 TOPIC_RUN_EVENT = "run/event"
 
-_SCHEMA_NAME = "lca/json_object"
-_SCHEMA_JSON = b'{"type":"object"}'
+
+def topic_status(agent_id: str) -> str:
+    return f"agent/{agent_id}/status"
+
+
+_SCHEMA_ROOT_MESSAGE = "lca_stack.Envelope"
+# Foxglove uses `Schema.name` as the Protobuf root message type.
+_SCHEMA_NAME = _SCHEMA_ROOT_MESSAGE
+
+
+def _protobuf_file_descriptor_set() -> bytes:
+    """Return a FileDescriptorSet suitable for MCAP Protobuf schemas.
+
+    MCAP expects Protobuf schemas as serialized FileDescriptorSet bytes.
+    """
+    fds = descriptor_pb2.FileDescriptorSet()
+
+    # Our schema.
+    fdp = descriptor_pb2.FileDescriptorProto.FromString(pb.DESCRIPTOR.serialized_pb)
+    fds.file.append(fdp)
+
+    # Include Struct dependency to make logs self-contained for simple tooling.
+    import google.protobuf.struct_pb2 as struct_pb2
+
+    struct_fdp = descriptor_pb2.FileDescriptorProto.FromString(struct_pb2.DESCRIPTOR.serialized_pb)
+    fds.file.append(struct_fdp)
+
+    return fds.SerializeToString()
 
 
 class _McapWriter(Protocol):
@@ -18,6 +48,7 @@ class _McapWriter(Protocol):
     def finish(self) -> None: ...
 
     def register_schema(self, *, name: str, encoding: object, data: bytes) -> int: ...
+
     def register_channel(
         self,
         *,
@@ -44,6 +75,7 @@ class _ChannelIds:
     actuation_request: int
     actuation: int
     run_event: int
+    status: int
 
 
 class McapLogger:
@@ -55,6 +87,7 @@ class McapLogger:
     _actuation_sequence: int
     _actuation_final_sequence: int
     _event_sequence: int
+    _status_sequence: int
     _closed: bool
 
     def __init__(self, *, path: Path, writer: _McapWriter, file: BinaryIO, channels: _ChannelIds) -> None:
@@ -66,6 +99,7 @@ class McapLogger:
         self._actuation_sequence = 0
         self._actuation_final_sequence = 0
         self._event_sequence = 0
+        self._status_sequence = 0
         self._closed = False
 
     @property
@@ -91,36 +125,45 @@ class McapLogger:
 
         schema_id = writer.register_schema(
             name=_SCHEMA_NAME,
-            encoding=SchemaEncoding.JSONSchema,
-            data=_SCHEMA_JSON,
+            encoding=SchemaEncoding.Protobuf,
+            data=_protobuf_file_descriptor_set(),
         )
+
+        metadata = {"protobuf_root_message": _SCHEMA_ROOT_MESSAGE}
 
         observation_channel_id = writer.register_channel(
             topic=TOPIC_OBSERVATION,
-            message_encoding=MessageEncoding.JSON,
+            message_encoding=MessageEncoding.Protobuf,
             schema_id=schema_id,
-            metadata={},
+            metadata=metadata,
         )
 
         actuation_channel_id = writer.register_channel(
             topic=TOPIC_ACTUATION_REQUEST,
-            message_encoding=MessageEncoding.JSON,
+            message_encoding=MessageEncoding.Protobuf,
             schema_id=schema_id,
-            metadata={},
+            metadata=metadata,
         )
 
         actuation_final_channel_id = writer.register_channel(
             topic=TOPIC_ACTUATION,
-            message_encoding=MessageEncoding.JSON,
+            message_encoding=MessageEncoding.Protobuf,
             schema_id=schema_id,
-            metadata={},
+            metadata=metadata,
         )
 
         run_event_channel_id = writer.register_channel(
             topic=TOPIC_RUN_EVENT,
-            message_encoding=MessageEncoding.JSON,
+            message_encoding=MessageEncoding.Protobuf,
             schema_id=schema_id,
-            metadata={},
+            metadata=metadata,
+        )
+
+        status_channel_id = writer.register_channel(
+            topic=topic_status(agent_id),
+            message_encoding=MessageEncoding.Protobuf,
+            schema_id=schema_id,
+            metadata=metadata,
         )
 
         channels = _ChannelIds(
@@ -128,6 +171,7 @@ class McapLogger:
             actuation_request=actuation_channel_id,
             actuation=actuation_final_channel_id,
             run_event=run_event_channel_id,
+            status=status_channel_id,
         )
         return cls(path=path, writer=writer, file=file, channels=channels)
 
@@ -169,6 +213,16 @@ class McapLogger:
             publish_time=int(publish_time_ns),
             data=payload,
             sequence=int(self._event_sequence),
+        )
+
+    def log_status(self, log_time_ns: int, publish_time_ns: int, payload: bytes) -> None:
+        self._status_sequence = (self._status_sequence + 1) & 0xFFFFFFFF
+        self._writer.add_message(
+            self._channels.status,
+            log_time=int(log_time_ns),
+            publish_time=int(publish_time_ns),
+            data=payload,
+            sequence=int(self._status_sequence),
         )
 
     def close(self) -> None:

@@ -93,18 +93,38 @@ lca-daemon --agent-id cf1 --adapter-port 5001 --autonomy-port 5002
 
 ### Connect an Adapter and Autonomy
 
-- **Adapter** connects to the daemon’s **adapter port** (example: `5001`) and publishes platform observations as JSONL.
-- **Autonomy** connects to the daemon’s **autonomy port** (example: `5002`) and publishes actuation requests as JSONL.
+- **Adapter** connects to the daemon’s **adapter port** (example: `5001`) and publishes **LocalObservation** envelopes.
+- **Autonomy** connects to the daemon’s **autonomy port** (example: `5002`) and publishes **ActuationRequest** envelopes.
 
-On connect, the daemon immediately sends a one-line **handshake** (`kind: lca_handshake_v1`) so both sides learn:
-- `run_id` (daemon-generated; source of truth for artifacts)
-- `agent_id` (daemon config)
-- `protocol_version`
-- ports + scenario/seed (if provided on the daemon CLI)
+#### Transport: framed Protobuf over TCP
 
-After the handshake, processes exchange newline-delimited JSON objects. Each message should include the common `header` fields described below. In Python you can use `lca_stack.ipc.make_header(...)`.
+The local link is **length-prefixed Protobuf**:
 
-If a message arrives without a valid header, the daemon will **inject** one using daemon time, mark the payload with `lca_meta.header_injected: true`, and emit a `run/event` warning.
+- Each frame begins with a **4-byte big-endian length prefix** (N).
+- The next N bytes are a serialized Protobuf message.
+
+All post-handshake traffic uses the versioned `Envelope` message defined in `proto/lca_stack.proto`.
+
+#### Schema sources vs generated bindings
+
+- `proto/lca_stack.proto` is the **canonical** schema definition (language-agnostic).
+- `src/lca_stack/proto/lca_stack_pb2.py` is the **generated Python binding** used by the daemon
+  and Python adapters. It is committed so users of the core package do not need a Protobuf compiler
+  at runtime.
+
+#### Protocol negotiation handshake
+
+Immediately after connecting, the daemon and client perform a small handshake so both sides learn the run identity and agree on a schema version:
+
+1. `daemon_hello` (daemon → client): advertises `protocol_version` and supported `schema_version`s, includes daemon-owned `run_id`, configured `agent_id`, ports, and optional scenario/seed.
+2. `client_hello` (client → daemon): selects a `schema_version`.
+3. `daemon_confirm` (daemon → client): confirms the selected `schema_version`.
+
+In Python, use `FramedClient(...).connect()` followed by `client_handshake(link=..., role="adapter"|"autonomy")`.
+
+#### Headers and missing headers
+
+Each `Envelope` includes a `header` (run_id, agent_id, seq, t_mono_ns, t_wall_ns). If an envelope arrives **without a populated header**, the daemon will **inject** one using daemon time, set `envelope.header_injected = true`, and emit a `run/event` warning.
 
 ### Run artifacts
 
@@ -121,15 +141,13 @@ The daemon writes `manifest.yaml` at run start and finalizes it at run stop. Run
 
 ### Example adapters and autonomy
 
-This repo includes example implementations under `examples/`. They are optional and meant as reference adapters/autonomy processes for the daemon IPC.
+LCA Stack is **platform-agnostic**: the daemon and autonomy process are unchanged
+across simulators and real robots. The **only platform-specific code** is the
+adapter.
 
-Example (Spot velocity teleop):
-
-```bash
-python3 examples/autonomy/spot_keyboard.py --host 127.0.0.1 --port 5002 --agent-id cf1
-```
-
-For simulator-specific wiring (for example Webots `controllerArgs`), see the example adapter directory under `examples/`.
+Adapters/autonomy examples are intentionally kept out of the core library
+distribution (and should live in a separate, platform-specific repo or a local
+workspace) so the core remains minimal and portable.
 
 ---
 
@@ -143,7 +161,7 @@ For simulator-specific wiring (for example Webots `controllerArgs`), see the exa
 - **Agent Daemon**: Standard infrastructure process that provides:
   - DDS messaging (publish/subscribe)
   - MCAP recording (flight recorder)
-  - Safety Guard (local command checks)
+  - Safety Guard (team/run-level command checks)
   - Run lifecycle events and run manifest
 
 ### Acronyms
@@ -177,6 +195,25 @@ Standard topics:
 - **TeamMessage**: Coordination information that is not a direct command.
 - **Event**: Lifecycle and safety events (run start/stop, safety clamp, fault transitions).
 
+#### On-wire structure: versioned Envelope
+
+Both the local IPC and the MCAP logs record a single **versioned `Envelope`** message (`proto/lca_stack.proto`). It contains:
+
+- `schema_version` (uint32)
+- `header` (run_id, agent_id, seq, t_mono_ns, t_wall_ns)
+- `topic` + `kind` (string routing + application-level type tag)
+- `origin_agent_id`, `origin_seq`, `origin_topic` (cross-log identity)
+- a `oneof payload` holding one of:
+  - the 4 core messages above (`Command`, `Status`, `TeamMessage`, `Event`)
+  - local-loop messages (`LocalObservation`, `ActuationRequest`, `Actuation`)
+
+The daemon performs lightweight validation of required fields and will emit a `run/event` warning for invalid messages.
+
+#### Status fields (current)
+
+The daemon periodically emits `agent/<agent_id>/status` to the autonomy link with:
+`mode`, `faults`, `estop`, `heartbeat_seq`, `daemon_wall_ns`, and the last seen wall times for adapter/autonomy/team Rx/Tx.
+
 ### Common header
 
 Every message recorded or transmitted should include a common header to support analysis and debugging:
@@ -192,7 +229,7 @@ Why these fields exist:
 - `t_mono_ns` provides strict ordering within one process / machine.
 - `t_wall_ns` enables cross-agent alignment **only** when you have a clock sync / offset model.
 
-Time model:
+Time model (important):
 - `t_mono_ns`: **originating process monotonic time**. Use this for ordering on that machine. It should be non-decreasing per `(origin_agent_id, origin_topic)`.
 - `t_wall_ns`: **originating process wall time**. Cross-agent comparisons require time synchronization (e.g., **PTP** via linuxptp, or NTP as a looser alternative) or an explicit offset model.
 - MCAP `log_time`: **daemon receive time** (wall-like time computed from a monotonic anchor so it won’t go backward). This is reliable for local ordering inside one daemon even if the system wall clock jumps.
@@ -236,7 +273,7 @@ Each run produces:
 Each agent writes an MCAP file containing time-stamped streams for:
 - `local/adapter/observation` — observations sent from Adapter → Daemon (and forwarded to Autonomy)
 - `local/autonomy/actuation_request` — requests sent from Autonomy → Daemon
-- `local/adapter/actuation` — the final actuation the Adapter receives (post-safety; currently pass-through)
+- `local/adapter/actuation` — the final actuation the Adapter receives (post-safety; may be overridden/stopped)
 - `run/event` — lifecycle + diagnostics (handshake, `run_start`, `run_stop`, disconnects, warnings)
 
 MCAP timestamps:
@@ -250,6 +287,7 @@ Recording both **sent** and **received** DDS messages matters: it preserves what
 Each run produces a small manifest file that describes:
 - `run_id` + `agent_id`
 - `host` + ports (`adapter`, `autonomy`)
+- `protocol_version` + `schema_version`
 - `start_wall` / `end_wall`
 - scenario + seed (if provided)
 - clock anchors + a lightweight clock health snapshot (offset/spread diagnostics)
@@ -329,9 +367,9 @@ The Agent Daemon provides the standard experiment infrastructure.
   - Records local observations and actuation exchanged with Adapter and Autonomy.
   - Records run lifecycle and safety events.
 - **Safety Guard**
-  - Validates outgoing actuation against local constraints.
-  - Can clamp, override, or stop actuation.
-  - Emits events explaining interventions.
+  - Runs a **team / run-level safety stage** on the autonomy→adapter path.
+  - Can gate, override, or stop actuation based on collaboration semantics (e.g., run mode, command expiry, target mismatch, estop).
+  - Emits `run/event` warnings explaining interventions.
 - **Run Lifecycle**
   - Starts/stops recording.
   - Emits run events (`run_start`, `run_stop`, etc.).
@@ -356,7 +394,7 @@ There are typically two local links:
 - Adapter ⇄ Agent Daemon
 - Autonomy Process ⇄ Agent Daemon
 
-A simple approach is newline-delimited JSON over localhost TCP during early development, later replaced by a stricter schema (for example, Protocol Buffers) once the message fields stabilize.
+The reference implementation uses **length-prefixed Protobuf** over localhost TCP, with a small handshake for protocol/schema negotiation. All messages after the handshake are `Envelope` Protobuf messages.
 
 ### End-to-end flow
 
@@ -398,10 +436,13 @@ In parallel with (A) and (B):
 The Safety Guard runs inside the Agent Daemon and sits on the command path to the platform.
 
 Typical checks:
-- Mode gating (ignore actuation unless the run is in “running” mode)
-- Bounds checks (speed, acceleration, workspace limits)
-- Fault response (transition to safe-stop on fault)
-- Emergency stop handling
+
+- Run / mode gating (ignore actuation unless the daemon is in `MODE_RUNNING`)
+- Target/ownership checks (drop or stop commands addressed to the wrong agent)
+- Expiry checks (drop actuation requests whose `expires_wall_ns` is in the past)
+- Emergency stop (latches estop via local `Command` or internal faults)
+
+**Low-level, platform-specific** checks (joint limits, speed/accel limits, workspace constraints) belong in the Adapter, since they are robot/simulator-specific.
 
 Every intervention generates an Event that is recorded and can be displayed during post-run analysis.
 

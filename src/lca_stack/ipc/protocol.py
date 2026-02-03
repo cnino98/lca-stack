@@ -1,169 +1,310 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, Mapping, TypedDict, cast
 
-from .clock import now_mono_ns, now_wall_ns
-from .header import HeaderDict, make_header
+from lca_stack.proto import lca_stack_pb2 as pb
 
-# IPC protocol version.
-#
-# Bump when the daemon<->process JSONL framing or required fields change.
-PROTOCOL_VERSION: int = 1
+from .clock import now_mono_ns
+from .framing import FramedSocket
+from .header import make_header
+from .structs import dict_to_struct
 
-# Well-known message kinds produced by the daemon.
-KIND_HANDSHAKE_V1 = "lca_handshake_v1"
-KIND_RUN_EVENT_V1 = "lca_run_event_v1"
+# Wire protocol (framed protobuf) version.
+PROTOCOL_VERSION: int = 2
 
+# Envelope schema version.
+SCHEMA_VERSION: int = 1
 
-class HandshakeDict(TypedDict):
-    header: HeaderDict
-    topic: str
-    kind: str
-    protocol_version: int
-    role: str
-    run_id: str
-    agent_id: str
-    ports: dict[str, int]
-    scenario: str | None
-    seed: int | None
+# Handshake stages.
+STAGE_DAEMON_HELLO = "daemon_hello"
+STAGE_CLIENT_HELLO = "client_hello"
+STAGE_DAEMON_CONFIRM = "daemon_confirm"
 
 
 @dataclass(frozen=True, slots=True)
-class Handshake:
+class HandshakeResult:
     run_id: str
     agent_id: str
-    protocol_version: int
     role: str
+    protocol_version: int
+    schema_version: int
     adapter_port: int
     autonomy_port: int
     scenario: str | None
     seed: int | None
 
 
-def make_handshake(
+def _supported_schema_versions() -> list[int]:
+    return [SCHEMA_VERSION]
+
+
+def daemon_handshake(
     *,
+    link: FramedSocket,
+    role: str,
     run_id: str,
     agent_id: str,
-    role: str,
     adapter_port: int,
     autonomy_port: int,
     scenario: str | None,
     seed: int | None,
-) -> HandshakeDict:
-    # Sequence 0 is reserved for daemon lifecycle messages.
-    header = make_header(run_id, agent_id, seq=0)
-    return HandshakeDict(
-        header=header,
-        topic="run/event",
-        kind=KIND_HANDSHAKE_V1,
+) -> HandshakeResult:
+    """Perform daemon-side handshake negotiation.
+
+    The daemon sends a hello with supported schema versions, receives the client selection,
+    then confirms.
+    """
+    hello = pb.Handshake(
         protocol_version=int(PROTOCOL_VERSION),
+        supported_schema_versions=[int(v) for v in _supported_schema_versions()],
+        selected_schema_version=0,
         role=str(role),
+        stage=STAGE_DAEMON_HELLO,
         run_id=str(run_id),
         agent_id=str(agent_id),
-        ports={"adapter": int(adapter_port), "autonomy": int(autonomy_port)},
+        adapter_port=int(adapter_port),
+        autonomy_port=int(autonomy_port),
+        scenario=str(scenario) if scenario is not None else "",
+        seed=int(seed) if seed is not None else 0,
+        message="",
+    )
+    link.write_message(hello)
+
+    resp = pb.Handshake()
+    link.read_message(resp)
+    if resp.stage != STAGE_CLIENT_HELLO:
+        raise ValueError("expected client_hello handshake")
+    if int(resp.protocol_version) != int(PROTOCOL_VERSION):
+        raise ValueError("protocol_version mismatch")
+
+    selected = int(resp.selected_schema_version)
+    if selected not in _supported_schema_versions():
+        raise ValueError("unsupported schema_version selected")
+
+    confirm = pb.Handshake(
+        protocol_version=int(PROTOCOL_VERSION),
+        supported_schema_versions=[int(v) for v in _supported_schema_versions()],
+        selected_schema_version=int(selected),
+        role=str(role),
+        stage=STAGE_DAEMON_CONFIRM,
+        run_id=str(run_id),
+        agent_id=str(agent_id),
+        adapter_port=int(adapter_port),
+        autonomy_port=int(autonomy_port),
+        scenario=str(scenario) if scenario is not None else "",
+        seed=int(seed) if seed is not None else 0,
+        message="",
+    )
+    link.write_message(confirm)
+
+    return HandshakeResult(
+        run_id=str(run_id),
+        agent_id=str(agent_id),
+        role=str(role),
+        protocol_version=int(PROTOCOL_VERSION),
+        schema_version=int(selected),
+        adapter_port=int(adapter_port),
+        autonomy_port=int(autonomy_port),
         scenario=str(scenario) if scenario is not None else None,
         seed=int(seed) if seed is not None else None,
     )
 
 
-def extract_handshake(msg: Any) -> Handshake | None:
-    """Parse a handshake message.
+def client_handshake(*, link: FramedSocket, role: str) -> HandshakeResult:
+    """Perform client-side handshake negotiation.
 
-    Returns None if the object is not a handshake.
-    Raises ValueError if the object looks like a handshake but is malformed.
+    Reads the daemon hello, chooses a schema version, replies, and reads confirm.
     """
-    if not isinstance(msg, dict):
-        return None
-    kind = msg.get("kind")
-    if kind != KIND_HANDSHAKE_V1:
-        return None
+    hello = pb.Handshake()
+    link.read_message(hello)
+    if hello.stage != STAGE_DAEMON_HELLO:
+        raise ValueError("expected daemon_hello handshake")
+    if int(hello.protocol_version) != int(PROTOCOL_VERSION):
+        raise ValueError("protocol_version mismatch")
 
-    run_id = _as_str(msg.get("run_id"), field="run_id")
-    agent_id = _as_str(msg.get("agent_id"), field="agent_id")
-    protocol_version = _as_int(msg.get("protocol_version"), field="protocol_version")
-    role = _as_str(msg.get("role"), field="role")
+    supported: set[int] = set(int(v) for v in hello.supported_schema_versions)
+    if not supported:
+        raise ValueError("daemon did not advertise supported schema versions")
 
-    ports_raw = msg.get("ports")
-    if not isinstance(ports_raw, dict):
-        raise ValueError("ports must be an object")
-    ports = cast(Mapping[str, object], ports_raw)
-    adapter_port = _as_int(ports.get("adapter"), field="ports.adapter")
-    autonomy_port = _as_int(ports.get("autonomy"), field="ports.autonomy")
+    selected = max(v for v in supported if v <= SCHEMA_VERSION)
 
-    scenario_val = msg.get("scenario")
-    scenario = str(scenario_val) if isinstance(scenario_val, str) and scenario_val else None
-    seed_val = msg.get("seed")
-    seed = int(seed_val) if isinstance(seed_val, int) else None
+    resp = pb.Handshake(
+        protocol_version=int(PROTOCOL_VERSION),
+        supported_schema_versions=[int(SCHEMA_VERSION)],
+        selected_schema_version=int(selected),
+        role=str(role),
+        stage=STAGE_CLIENT_HELLO,
+        run_id=str(hello.run_id),
+        agent_id=str(hello.agent_id),
+        adapter_port=int(hello.adapter_port),
+        autonomy_port=int(hello.autonomy_port),
+        scenario=str(hello.scenario),
+        seed=int(hello.seed),
+        message="",
+    )
+    link.write_message(resp)
 
-    return Handshake(
-        run_id=run_id,
-        agent_id=agent_id,
-        protocol_version=protocol_version,
-        role=role,
-        adapter_port=adapter_port,
-        autonomy_port=autonomy_port,
+    confirm = pb.Handshake()
+    link.read_message(confirm)
+    if confirm.stage != STAGE_DAEMON_CONFIRM:
+        raise ValueError("expected daemon_confirm handshake")
+    if int(confirm.selected_schema_version) != int(selected):
+        raise ValueError("schema_version confirm mismatch")
+
+    scenario = str(confirm.scenario) if str(confirm.scenario) else None
+    seed = int(confirm.seed) if int(confirm.seed) != 0 else None
+
+    return HandshakeResult(
+        run_id=str(confirm.run_id),
+        agent_id=str(confirm.agent_id),
+        role=str(role),
+        protocol_version=int(confirm.protocol_version),
+        schema_version=int(selected),
+        adapter_port=int(confirm.adapter_port),
+        autonomy_port=int(confirm.autonomy_port),
         scenario=scenario,
         seed=seed,
     )
 
 
-def make_run_event(
+def make_event_envelope(
     *,
     run_id: str,
     agent_id: str,
-    event: str,
-    level: str = "INFO",
+    seq: int,
+    event_type: str,
+    severity: pb.Severity = pb.Severity.SEVERITY_INFO,
     message: str | None = None,
-    fields: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    header = HeaderDict(
+    data: dict[str, object] | None = None,
+) -> pb.Envelope:
+    ev = pb.Event(
+        event_type=str(event_type),
+        severity=severity,
+        message=str(message) if message is not None else "",
+    )
+    if data:
+        ev.data.CopyFrom(dict_to_struct(data))
+
+    header = make_header(run_id, agent_id, seq)
+    env = pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic="run/event",
+        kind="lca/event_v1",
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic="run/event",
+        event=ev,
+    )
+    return env
+
+
+def make_status_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    status: pb.Status,
+) -> pb.Envelope:
+    header = make_header(run_id, agent_id, seq)
+    topic = f"agent/{agent_id}/status"
+    env = pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind="lca/status_v1",
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic=topic,
+        status=status,
+    )
+    return env
+
+
+def make_observation_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    kind: str,
+    data: dict[str, object],
+) -> pb.Envelope:
+    header = make_header(run_id, agent_id, seq)
+    topic = "local/adapter/observation"
+    obs = pb.LocalObservation(data=dict_to_struct(data))
+    return pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind=str(kind),
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic=topic,
+        observation=obs,
+    )
+
+
+def make_actuation_request_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    kind: str,
+    data: dict[str, object],
+    target_agent_id: str | None = None,
+    expires_wall_ns: int | None = None,
+) -> pb.Envelope:
+    header = make_header(run_id, agent_id, seq)
+    topic = "local/autonomy/actuation_request"
+    req = pb.ActuationRequest(
+        target_agent_id=str(target_agent_id) if target_agent_id else "",
+        expires_wall_ns=int(expires_wall_ns) if expires_wall_ns is not None else 0,
+        data=dict_to_struct(data),
+    )
+    return pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind=str(kind),
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic=topic,
+        actuation_request=req,
+    )
+
+
+def make_actuation_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    kind: str,
+    data: dict[str, object],
+    safety_applied: bool,
+    safety_reason: str,
+    origin_agent_id: str,
+    origin_seq: int,
+    origin_topic: str,
+    publish_time_ns: int,
+) -> pb.Envelope:
+    # Actuation uses header times from daemon at emission (publish_time_ns), but preserves
+    # origin identity for cross-log matching.
+    header = pb.Header(
         run_id=str(run_id),
         agent_id=str(agent_id),
-        seq=0,
+        seq=int(seq),
         t_mono_ns=int(now_mono_ns()),
-        t_wall_ns=int(now_wall_ns()),
+        t_wall_ns=int(publish_time_ns),
     )
-    obj: dict[str, Any] = {
-        "header": header,
-        "topic": "run/event",
-        "kind": KIND_RUN_EVENT_V1,
-        "event": str(event),
-        "level": str(level),
-    }
-    if message is not None:
-        obj["message"] = str(message)
-    if fields:
-        obj["fields"] = dict(fields)
-    return obj
-
-
-def dumps_json(obj: Any) -> str:
-    # Stable compact encoding for IPC.
-    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
-
-
-def _as_str(value: object, *, field: str) -> str:
-    if not isinstance(value, str) or value == "":
-        raise ValueError(f"missing {field}")
-    return value
-
-
-def _as_int(value: object, *, field: str) -> int:
-    if value is None:
-        raise ValueError(f"missing {field}")
-    if isinstance(value, bool):
-        raise ValueError(f"{field} must be an integer")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if not value.is_integer():
-            raise ValueError(f"{field} must be an integer")
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError as e:
-            raise ValueError(f"{field} must be an integer") from e
-    raise ValueError(f"{field} must be an integer")
+    topic = "local/adapter/actuation"
+    act = pb.Actuation(safety_applied=bool(safety_applied), safety_reason=str(safety_reason), data=dict_to_struct(data))
+    return pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind=str(kind),
+        origin_agent_id=str(origin_agent_id),
+        origin_seq=int(origin_seq),
+        origin_topic=str(origin_topic),
+        actuation=act,
+    )

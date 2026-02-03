@@ -28,6 +28,14 @@ __MACOSX/
 .vscode/
 .idea/
 
+# --- Local-only demos / adapters ---
+# Keep the core library platform-agnostic. Platform-specific adapters live here
+# for local development but should not be committed to the core repo.
+examples/
+
+# --- Optional vendored runtime deps (not part of core) ---
+src/lca_stack/vendor/
+
 # --- Run artifacts ---
 runs/
 *.mcap
@@ -35,9 +43,10 @@ runs/
 # --- Logs ---
 *.log
 
-# --- Webots extras ---
+# --- Simulator / editor artifacts (generic) ---
 *.wbk
 *.wbo
+*.wbproj
 *.wbt~
 *.png~
 *.jpg
