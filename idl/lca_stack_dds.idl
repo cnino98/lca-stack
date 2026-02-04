@@ -1,0 +1,13 @@
+// LCA Stack DDS payload type.
+//
+// This IDL keeps the DDS layer language-agnostic by transporting the canonical
+// Protobuf `Envelope` bytes.
+//
+// Topic naming convention follows the README (e.g. "team/command").
+// Each DDS sample's `data` is a serialized `proto/lca_stack.proto` Envelope.
+
+module lca_stack {
+  struct EnvelopeBytes {
+    sequence<octet> data;
+  };
+};

@@ -15,6 +15,10 @@ LCA Stack standardizes how agents communicate and how experiments are recorded. 
     - [Install](#install)
     - [Run the Agent Daemon](#run-the-agent-daemon)
     - [Connect an Adapter and Autonomy](#connect-an-adapter-and-autonomy)
+      - [Transport: framed Protobuf over TCP](#transport-framed-protobuf-over-tcp)
+      - [Schema sources vs generated bindings](#schema-sources-vs-generated-bindings)
+      - [Protocol negotiation handshake](#protocol-negotiation-handshake)
+      - [Headers and missing headers](#headers-and-missing-headers)
     - [Run artifacts](#run-artifacts)
     - [Example adapters and autonomy](#example-adapters-and-autonomy)
   - [Key concepts, terminology, and acronyms](#key-concepts-terminology-and-acronyms)
@@ -23,6 +27,8 @@ LCA Stack standardizes how agents communicate and how experiments are recorded. 
   - [Messaging model](#messaging-model)
     - [Topics](#topics)
     - [Message types](#message-types)
+      - [On-wire structure: versioned Envelope](#on-wire-structure-versioned-envelope)
+      - [Status fields (current)](#status-fields-current)
     - [Common header](#common-header)
     - [Delivery settings (QoS)](#delivery-settings-qos)
   - [Logging and run artifacts](#logging-and-run-artifacts)
@@ -64,13 +70,13 @@ The stack is designed so that:
 ## Quickstart
 
 ### Requirements
-- Python 3.10+
+- Python 3.10
 - A platform-specific **Adapter** process and an **Autonomy** process (any language). Both connect locally to the Agent Daemon.
 
 ### Install
 
 ```bash
-python3 -m venv venv
+python3.10 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```

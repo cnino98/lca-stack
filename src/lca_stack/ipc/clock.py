@@ -4,24 +4,26 @@ import time
 
 
 def now_wall_ns() -> int:
-    return time.time_ns()
+    return int(time.time_ns())
 
 
 def now_mono_ns() -> int:
-    return time.monotonic_ns()
+    return int(time.monotonic_ns())
 
 
 class MonotonicWallClock:
-    """
-    Wall-clock-like timestamps that never go backward:
-    anchor system wall time at init, then advance using monotonic time deltas.
+    """Wall-clock-like timestamps that never go backward.
+
+    This anchors the current wall time at initialization, then advances using
+    monotonic deltas. It prevents occasional wall-clock adjustments (e.g. NTP)
+    from making timestamps non-monotonic.
     """
 
     __slots__ = ("_wall0", "_mono0")
 
     def __init__(self) -> None:
-        self._wall0 = time.time_ns()
-        self._mono0 = time.monotonic_ns()
+        self._wall0 = int(time.time_ns())
+        self._mono0 = int(time.monotonic_ns())
 
     @property
     def wall0_ns(self) -> int:
@@ -32,4 +34,4 @@ class MonotonicWallClock:
         return int(self._mono0)
 
     def now_wall_ns(self) -> int:
-        return int(self._wall0 + (time.monotonic_ns() - self._mono0))
+        return int(self._wall0 + (int(time.monotonic_ns()) - self._mono0))

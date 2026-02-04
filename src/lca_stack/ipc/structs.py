@@ -8,7 +8,7 @@ from google.protobuf.struct_pb2 import Struct
 
 def dict_to_struct(data: Mapping[str, Any]) -> Struct:
     s = Struct()
-    # Struct.update performs best-effort conversion.
+    # Struct.update performs best-effort conversion (including nested mappings/lists).
     s.update(dict(data))
     return s
 

@@ -1,9 +1,68 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+
+def _repo_root() -> Path | None:
+    """Best-effort repository root for git metadata.
+
+    In a source checkout, this file is typically:
+      <repo>/src/lca_stack/run/manifest.py
+
+    When installed from a wheel/sdist, git metadata may not be available.
+    """
+    here = Path(__file__).resolve()
+    try:
+        # run/ -> lca_stack/ -> src/ -> <repo>
+        return here.parents[3]
+    except Exception:
+        return None
+
+
+def _try_git_info() -> dict[str, Any] | None:
+    root = _repo_root()
+    if root is None:
+        return None
+
+    try:
+        sha = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+        if not sha:
+            return None
+
+        dirty = (
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                cwd=root,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+        return {"sha": str(sha), "dirty": bool(dirty)}
+    except Exception:
+        return None
+
+
+def _try_package_version() -> str | None:
+    try:
+        from importlib import metadata
+
+        return str(metadata.version("lca-stack"))
+    except Exception:
+        return None
 
 
 def wall_ns_to_iso8601(wall_ns: int) -> str:
@@ -12,9 +71,18 @@ def wall_ns_to_iso8601(wall_ns: int) -> str:
 
 
 def write_manifest(path: Path, data: Mapping[str, Any]) -> None:
+    """Write a manifest as YAML.
+
+    Uses an atomic replace to avoid partially-written files on interruption.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     text = _dump_yaml(data)
-    path.write_text(text, encoding="utf-8")
+    if not text.endswith("\n"):
+        text += "\n"
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _dump_yaml(obj: Any, *, indent: int = 0) -> str:
@@ -34,7 +102,7 @@ def _dump_yaml(obj: Any, *, indent: int = 0) -> str:
     if isinstance(obj, float):
         return f"{obj}\n" if indent == 0 else repr(obj)
     if isinstance(obj, str):
-        return (f"{_quote_yaml_str(obj)}\n" if indent == 0 else _quote_yaml_str(obj))
+        return f"{_quote_yaml_str(obj)}\n" if indent == 0 else _quote_yaml_str(obj)
 
     if isinstance(obj, list):
         if not obj:
@@ -51,7 +119,7 @@ def _dump_yaml(obj: Any, *, indent: int = 0) -> str:
     if isinstance(obj, dict):
         if not obj:
             return "{}\n" if indent == 0 else "{}"
-        lines = []
+        lines: list[str] = []
         for k in sorted(obj.keys(), key=str):
             key = str(k)
             val = obj[k]
@@ -95,9 +163,21 @@ def build_manifest_start(
     scenario: str | None,
     seed: int | None,
     clock: ClockSnapshot,
+    run_id_mode: str | None = None,
+    dds: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    git_info = _try_git_info()
+    pkg_version = _try_package_version()
+
+    software: dict[str, Any] = {
+        "package": {"name": "lca-stack", "version": pkg_version},
+        "git": git_info,
+    }
+
     return {
         "run_id": str(run_id),
+        "run_id_mode": str(run_id_mode) if run_id_mode is not None else None,
         "agent_id": str(agent_id),
         "protocol_version": int(protocol_version),
         "schema_version": int(schema_version),
@@ -112,6 +192,12 @@ def build_manifest_start(
         "ports": {"adapter": int(adapter_port), "autonomy": int(autonomy_port)},
         "scenario": str(scenario) if scenario is not None else None,
         "seed": int(seed) if seed is not None else None,
+        "dds": dict(dds) if dds is not None else None,
+        "participants": [str(agent_id)],
+        "software": software,
+        "config": dict(config) if config is not None else None,
+        "notes": None,
+        "outcomes": None,
         "clock": {
             "daemon_wall_ns": int(clock.daemon_wall_ns),
             "daemon_mono_ns": int(clock.daemon_mono_ns),
@@ -127,9 +213,12 @@ def finalize_manifest(
     *,
     end_wall_ns: int,
     clock_health: Mapping[str, Any] | None,
+    participants: list[str] | None = None,
 ) -> dict[str, Any]:
     out = dict(manifest)
     out["end_wall_ns"] = int(end_wall_ns)
     out["end_wall"] = wall_ns_to_iso8601(end_wall_ns)
     out["clock_health"] = dict(clock_health) if clock_health is not None else None
+    if participants is not None:
+        out["participants"] = [str(p) for p in participants]
     return out

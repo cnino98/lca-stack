@@ -6,7 +6,6 @@ from lca_stack.proto import lca_stack_pb2 as pb
 
 from .clock import now_mono_ns, now_wall_ns
 
-
 Header = pb.Header
 
 
@@ -28,8 +27,7 @@ def make_header(run_id: str, agent_id: str, seq: int) -> Header:
 
 
 def header_is_populated(h: Header) -> bool:
-    # seq may legitimately be 0 (daemon lifecycle messages). Treat run_id/agent_id and
-    # timestamps as the presence check.
+    # seq may legitimately be 0; treat identity + timestamps as presence check.
     return bool(h.run_id) and bool(h.agent_id) and int(h.t_wall_ns) != 0 and int(h.t_mono_ns) != 0
 
 

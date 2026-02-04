@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 from lca_stack.proto import lca_stack_pb2 as pb
 
-from .clock import now_mono_ns
+from .clock import now_mono_ns, now_wall_ns
 from .framing import FramedSocket
 from .header import make_header
 from .structs import dict_to_struct
@@ -38,6 +39,17 @@ def _supported_schema_versions() -> list[int]:
     return [SCHEMA_VERSION]
 
 
+def _select_schema_version(advertised: Iterable[int]) -> int:
+    supported = [int(v) for v in advertised]
+    candidates = [v for v in supported if v <= int(SCHEMA_VERSION)]
+    if not candidates:
+        raise ValueError(
+            f"no compatible schema_version (daemon supports {sorted(set(supported))}, "
+            f"client supports <= {int(SCHEMA_VERSION)})"
+        )
+    return int(max(candidates))
+
+
 def daemon_handshake(
     *,
     link: FramedSocket,
@@ -49,11 +61,6 @@ def daemon_handshake(
     scenario: str | None,
     seed: int | None,
 ) -> HandshakeResult:
-    """Perform daemon-side handshake negotiation.
-
-    The daemon sends a hello with supported schema versions, receives the client selection,
-    then confirms.
-    """
     hello = pb.Handshake(
         protocol_version=int(PROTOCOL_VERSION),
         supported_schema_versions=[int(v) for v in _supported_schema_versions()],
@@ -111,10 +118,6 @@ def daemon_handshake(
 
 
 def client_handshake(*, link: FramedSocket, role: str) -> HandshakeResult:
-    """Perform client-side handshake negotiation.
-
-    Reads the daemon hello, chooses a schema version, replies, and reads confirm.
-    """
     hello = pb.Handshake()
     link.read_message(hello)
     if hello.stage != STAGE_DAEMON_HELLO:
@@ -122,11 +125,10 @@ def client_handshake(*, link: FramedSocket, role: str) -> HandshakeResult:
     if int(hello.protocol_version) != int(PROTOCOL_VERSION):
         raise ValueError("protocol_version mismatch")
 
-    supported: set[int] = set(int(v) for v in hello.supported_schema_versions)
-    if not supported:
+    if not hello.supported_schema_versions:
         raise ValueError("daemon did not advertise supported schema versions")
 
-    selected = max(v for v in supported if v <= SCHEMA_VERSION)
+    selected = _select_schema_version(int(v) for v in hello.supported_schema_versions)
 
     resp = pb.Handshake(
         protocol_version=int(PROTOCOL_VERSION),
@@ -186,29 +188,23 @@ def make_event_envelope(
         ev.data.CopyFrom(dict_to_struct(data))
 
     header = make_header(run_id, agent_id, seq)
-    env = pb.Envelope(
+    topic = "run/event"
+    return pb.Envelope(
         schema_version=int(SCHEMA_VERSION),
         header=header,
-        topic="run/event",
+        topic=topic,
         kind="lca/event_v1",
         origin_agent_id=str(header.agent_id),
         origin_seq=int(header.seq),
-        origin_topic="run/event",
+        origin_topic=topic,
         event=ev,
     )
-    return env
 
 
-def make_status_envelope(
-    *,
-    run_id: str,
-    agent_id: str,
-    seq: int,
-    status: pb.Status,
-) -> pb.Envelope:
+def make_status_envelope(*, run_id: str, agent_id: str, seq: int, status: pb.Status) -> pb.Envelope:
     header = make_header(run_id, agent_id, seq)
     topic = f"agent/{agent_id}/status"
-    env = pb.Envelope(
+    return pb.Envelope(
         schema_version=int(SCHEMA_VERSION),
         header=header,
         topic=topic,
@@ -218,17 +214,9 @@ def make_status_envelope(
         origin_topic=topic,
         status=status,
     )
-    return env
 
 
-def make_observation_envelope(
-    *,
-    run_id: str,
-    agent_id: str,
-    seq: int,
-    kind: str,
-    data: dict[str, object],
-) -> pb.Envelope:
+def make_observation_envelope(*, run_id: str, agent_id: str, seq: int, kind: str, data: dict[str, object]) -> pb.Envelope:
     header = make_header(run_id, agent_id, seq)
     topic = "local/adapter/observation"
     obs = pb.LocalObservation(data=dict_to_struct(data))
@@ -256,8 +244,9 @@ def make_actuation_request_envelope(
 ) -> pb.Envelope:
     header = make_header(run_id, agent_id, seq)
     topic = "local/autonomy/actuation_request"
+    target = target_agent_id if target_agent_id is not None else agent_id
     req = pb.ActuationRequest(
-        target_agent_id=str(target_agent_id) if target_agent_id else "",
+        target_agent_id=str(target) if target else "",
         expires_wall_ns=int(expires_wall_ns) if expires_wall_ns is not None else 0,
         data=dict_to_struct(data),
     )
@@ -285,19 +274,27 @@ def make_actuation_envelope(
     origin_agent_id: str,
     origin_seq: int,
     origin_topic: str,
-    publish_time_ns: int,
+    publish_time_ns: int | None = None,
 ) -> pb.Envelope:
-    # Actuation uses header times from daemon at emission (publish_time_ns), but preserves
-    # origin identity for cross-log matching.
+    """Create an Actuation envelope (daemon -> adapter).
+
+    `publish_time_ns` is optional for backwards compatibility; when not provided,
+    it defaults to the current wall clock.
+    """
+    publish_wall_ns = int(now_wall_ns() if publish_time_ns is None else publish_time_ns)
     header = pb.Header(
         run_id=str(run_id),
         agent_id=str(agent_id),
         seq=int(seq),
         t_mono_ns=int(now_mono_ns()),
-        t_wall_ns=int(publish_time_ns),
+        t_wall_ns=int(publish_wall_ns),
     )
     topic = "local/adapter/actuation"
-    act = pb.Actuation(safety_applied=bool(safety_applied), safety_reason=str(safety_reason), data=dict_to_struct(data))
+    act = pb.Actuation(
+        safety_applied=bool(safety_applied),
+        safety_reason=str(safety_reason),
+        data=dict_to_struct(data),
+    )
     return pb.Envelope(
         schema_version=int(SCHEMA_VERSION),
         header=header,
@@ -307,4 +304,59 @@ def make_actuation_envelope(
         origin_seq=int(origin_seq),
         origin_topic=str(origin_topic),
         actuation=act,
+    )
+
+
+def make_team_message_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    message_type: str,
+    data: dict[str, object],
+) -> pb.Envelope:
+    header = make_header(run_id, agent_id, seq)
+    topic = "team/message"
+    msg = pb.TeamMessage(message_type=str(message_type), data=dict_to_struct(data))
+    return pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind=str(message_type),
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic=topic,
+        team_message=msg,
+    )
+
+
+def make_command_envelope(
+    *,
+    run_id: str,
+    agent_id: str,
+    seq: int,
+    command_type: str,
+    target_agent_id: str | None = None,
+    target_group: str | None = None,
+    params: dict[str, object] | None = None,
+) -> pb.Envelope:
+    header = make_header(run_id, agent_id, seq)
+    topic = "team/command"
+    cmd = pb.Command(
+        command_type=str(command_type),
+        target_agent_id=str(target_agent_id) if target_agent_id else "",
+        target_group=str(target_group) if target_group else "",
+    )
+    if params:
+        cmd.params.CopyFrom(dict_to_struct(params))
+
+    return pb.Envelope(
+        schema_version=int(SCHEMA_VERSION),
+        header=header,
+        topic=topic,
+        kind=str(command_type),
+        origin_agent_id=str(header.agent_id),
+        origin_seq=int(header.seq),
+        origin_topic=topic,
+        command=cmd,
     )

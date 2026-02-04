@@ -9,9 +9,11 @@ from .protocol import (
     daemon_handshake,
     make_actuation_envelope,
     make_actuation_request_envelope,
+    make_command_envelope,
     make_event_envelope,
     make_observation_envelope,
     make_status_envelope,
+    make_team_message_envelope,
 )
 from .structs import dict_to_struct, struct_to_dict
 from .validate import ValidationError, validate_envelope
@@ -37,6 +39,8 @@ __all__ = [
     "make_observation_envelope",
     "make_actuation_request_envelope",
     "make_actuation_envelope",
+    "make_team_message_envelope",
+    "make_command_envelope",
     "dict_to_struct",
     "struct_to_dict",
     "ValidationError",
